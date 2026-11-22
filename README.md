@@ -60,7 +60,7 @@ To try it from a phone on the same Wi-Fi, set `HOST=0.0.0.0` and open `http://<t
 |---|---|---|
 | `LLM_BASE_URL` | `http://192.168.87.10:11434` | Ollama on the 3090 PC |
 | `LLM_FALLBACK_URL` | (none) | second Ollama URL, used only if the first can't be reached (e.g. `http://192.168.87.10:11440`) |
-| `LLM_MODEL` | `gemma3:12b` | must already be installed (`ollama list`) |
+| `LLM_MODEL` | `gemma4:e4b` | must already be installed (`ollama list`). `gemma3:12b` also works (non-thinking; Ollama loads it on first use if it isn't loaded). |
 | `LLM_TIMEOUT_MS` | `45000` | per request |
 | `LLM_THINK` | `false` | Ollama `think` flag. `false` disables reasoning on thinking models (e.g. `gemma4:e4b`), whose thinking would otherwise use up the token budget and cut the JSON off. `gemma3:12b` ignores it. `true` allows thinking; `omit` doesn't send the field. If an older Ollama rejects `think` with a 400, the request is retried once without it. |
 | `LLM_NUM_PREDICT` | `600` | max output tokens (`options.num_predict`) |

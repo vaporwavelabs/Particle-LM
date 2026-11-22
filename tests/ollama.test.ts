@@ -6,10 +6,10 @@ import { GOOD_ANSWER, mockFetch, ndjsonResponse, ollamaStream } from './helpers.
 const cfg = loadLlmConfig({ LLM_BASE_URL: 'http://primary.test:11434', LLM_FALLBACK_URL: 'http://fallback.test:11440', LLM_TIMEOUT_MS: '2000' });
 
 describe('config', () => {
-  it('defaults to the 3090 Ollama and gemma3:12b', () => {
+  it('defaults to the 3090 Ollama and gemma4:e4b', () => {
     const c = loadLlmConfig({});
     expect(c.baseUrl).toBe('http://192.168.87.10:11434');
-    expect(c.model).toBe('gemma3:12b');
+    expect(c.model).toBe('gemma4:e4b');
     expect(c.fallbackUrl).toBeUndefined();
     expect(c.offline).toBe(false);
   });
@@ -17,7 +17,7 @@ describe('config', () => {
     const c = loadLlmConfig({ LLM_BASE_URL: 'file:///etc/passwd', LLM_FALLBACK_URL: 'http://u:p@x.test', LLM_MODEL: 'a b; rm' });
     expect(c.baseUrl).toBe('http://192.168.87.10:11434');
     expect(c.fallbackUrl).toBeUndefined();
-    expect(c.model).toBe('gemma3:12b');
+    expect(c.model).toBe('gemma4:e4b');
   });
   it('think/num_predict/tags timeout defaults and overrides', () => {
     const d = loadLlmConfig({});
@@ -46,7 +46,7 @@ describe('OllamaProvider.chat', () => {
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0].url).toBe('http://primary.test:11434/api/chat');
     const body = f.calls[0].body!;
-    expect(body.model).toBe('gemma3:12b');
+    expect(body.model).toBe('gemma4:e4b');
     expect(body.stream).toBe(true);
     expect(body.format).toEqual({ type: 'object' });
     expect(body).not.toHaveProperty('keep_alive');
@@ -164,7 +164,7 @@ describe('OllamaProvider.chat', () => {
 
 describe('OllamaProvider.status', () => {
   it('uses GET /api/tags only and detects the model', async () => {
-    const f = mockFetch(() => Response.json({ models: [{ name: 'gemma3:12b', model: 'gemma3:12b' }] }));
+    const f = mockFetch(() => Response.json({ models: [{ name: 'gemma4:e4b', model: 'gemma4:e4b' }] }));
     const s = await new OllamaProvider(cfg, f).status(true);
     expect(s).toEqual({ reachable: true, modelInstalled: true, via: 'primary' });
     expect(f.calls[0].url).toBe('http://primary.test:11434/api/tags');

@@ -21,10 +21,10 @@ async function start(handler: Parameters<typeof mockFetch>[0], extra: { producti
 
 describe('HTTP API', () => {
   it('status exposes mode + model but no URLs', async () => {
-    const { base } = await start(() => Response.json({ models: [{ name: 'gemma3:12b' }] }));
+    const { base } = await start(() => Response.json({ models: [{ name: 'gemma4:e4b' }] }));
     const res = await fetch(`${base}/api/llm/status`);
     const text = await res.text();
-    expect(JSON.parse(text)).toMatchObject({ mode: 'online', model: 'gemma3:12b' });
+    expect(JSON.parse(text)).toMatchObject({ mode: 'online', model: 'gemma4:e4b' });
     expect(text).not.toMatch(/10\.9\.8\.7|11434|http/);
   });
 

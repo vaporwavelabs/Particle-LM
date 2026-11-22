@@ -13,7 +13,7 @@ export interface LlmConfig {
 }
 
 export const DEFAULT_BASE_URL = 'http://192.168.87.10:11434';
-export const DEFAULT_MODEL = 'gemma3:12b';
+export const DEFAULT_MODEL = 'gemma4:e4b';
 
 function cleanUrl(v: string | undefined): string | undefined {
   if (!v || !v.trim()) return undefined;
