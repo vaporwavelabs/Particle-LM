@@ -30,12 +30,14 @@ export function startMockOllama(port = 0, { delayMs = 40 } = {}) {
           force: 1.6,
         });
         res.setHeader('content-type', 'application/x-ndjson');
+        // a few thinking chunks, like a reasoning model would send (must be ignored by the app)
+        res.write(JSON.stringify({ message: { role: 'assistant', content: '', thinking: 'Considering shapes {"shape":"cube"}' }, done: false }) + '\n');
         for (let i = 0; i < answer.length; i += 12) {
           if (res.destroyed) return;
           res.write(JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 12) }, done: false }) + '\n');
           await new Promise((r) => setTimeout(r, delayMs));
         }
-        res.end(JSON.stringify({ message: { role: 'assistant', content: '' }, done: true }) + '\n');
+        res.end(JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop' }) + '\n');
         return;
       }
       res.statusCode = 404;

@@ -19,6 +19,16 @@ describe('config', () => {
     expect(c.fallbackUrl).toBeUndefined();
     expect(c.model).toBe('gemma3:12b');
   });
+  it('think/num_predict/tags timeout defaults and overrides', () => {
+    const d = loadLlmConfig({});
+    expect(d.think).toBe(false);
+    expect(d.numPredict).toBe(600);
+    expect(d.tagsTimeoutMs).toBe(6000);
+    const o = loadLlmConfig({ LLM_THINK: 'true', LLM_NUM_PREDICT: '900', LLM_TAGS_TIMEOUT_MS: '8000' });
+    expect([o.think, o.numPredict, o.tagsTimeoutMs]).toEqual([true, 900, 8000]);
+    expect(loadLlmConfig({ LLM_THINK: 'omit' }).think).toBeUndefined();
+    expect(loadLlmConfig({ LLM_NUM_PREDICT: 'abc' }).numPredict).toBe(600);
+  });
   it('LLM_OFFLINE=1 disables the LLM', () => {
     expect(loadLlmConfig({ LLM_OFFLINE: '1' }).offline).toBe(true);
   });
@@ -41,6 +51,52 @@ describe('OllamaProvider.chat', () => {
     expect(body.format).toEqual({ type: 'object' });
     expect(body).not.toHaveProperty('keep_alive');
     expect(JSON.stringify(body)).not.toMatch(/keep_alive/);
+    expect(body.think).toBe(false);
+    expect((body.options as Record<string, unknown>).num_predict).toBe(600);
+  });
+
+  it('ignores message.thinking chunks (never counted as content)', async () => {
+    const thinking = 'Let me think about galaxies {"shape":"heart"} ... '.repeat(30);
+    const f = mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER, 4, { thinking })));
+    const deltas: string[] = [];
+    const res = await new OllamaProvider(cfg, f).chat([{ role: 'user', content: 'x' }], { onDelta: (c) => deltas.push(c) });
+    expect(res.text).toBe(GOOD_ANSWER);
+    expect(deltas.join('')).toBe(GOOD_ANSWER);
+  });
+
+  it('retries once without think when an older Ollama rejects it', async () => {
+    const f = mockFetch((_u, init) => {
+      const body = JSON.parse(String(init?.body));
+      if ('think' in body) return new Response('{"error":"\\"gemma3:12b\\" does not support thinking"}', { status: 400 });
+      return ndjsonResponse(ollamaStream(GOOD_ANSWER));
+    });
+    const res = await new OllamaProvider(cfg, f).chat([{ role: 'user', content: 'x' }]);
+    expect(res.text).toBe(GOOD_ANSWER);
+    expect(res.via).toBe('primary');
+    expect(f.calls).toHaveLength(2);
+    expect(f.calls[0].body!.think).toBe(false);
+    expect(f.calls[1].body).not.toHaveProperty('think');
+  });
+
+  it('does not retry other 400s', async () => {
+    const f = mockFetch(() => new Response('{"error":"invalid format"}', { status: 400 }));
+    await expect(new OllamaProvider(cfg, f).chat([{ role: 'user', content: 'x' }])).rejects.toMatchObject({ code: 'bad_status' });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('omits think entirely when LLM_THINK=omit', async () => {
+    const c = loadLlmConfig({ LLM_BASE_URL: 'http://primary.test:11434', LLM_THINK: 'omit' });
+    const f = mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER)));
+    await new OllamaProvider(c, f).chat([{ role: 'user', content: 'x' }]);
+    expect(f.calls[0].body).not.toHaveProperty('think');
+  });
+
+  it('done_reason=length -> bad_output / truncated', async () => {
+    const f = mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER.slice(0, 60), 3, { doneReason: 'length' })));
+    await expect(new OllamaProvider(cfg, f).chat([{ role: 'user', content: 'x' }])).rejects.toMatchObject({
+      code: 'bad_output',
+      reason: 'truncated',
+    });
   });
 
   it('falls back to LLM_FALLBACK_URL only on connection failure', async () => {

@@ -298,7 +298,7 @@ try {
 
   const chatCalls = mock.log.filter((l) => l.url === '/api/chat');
   check('mock Ollama: only /api/tags and /api/chat were called', mock.log.every((l) => l.url === '/api/tags' || l.url === '/api/chat'));
-  check('mock Ollama: no keep_alive sent, model gemma3:12b', chatCalls.length > 0 && chatCalls.every((c) => !('keep_alive' in c.body) && c.body.model === 'gemma3:12b'), `${chatCalls.length} chat calls`);
+  check('mock Ollama: no keep_alive sent, model gemma3:12b', chatCalls.length > 0 && chatCalls.every((c) => !('keep_alive' in c.body) && c.body.model === 'gemma3:12b' && c.body.think === false), `${chatCalls.length} chat calls, think:false on all`);
 } catch (err) {
   check('smoke run completed', false, String(err?.stack || err));
 } finally {

@@ -46,6 +46,22 @@ describe('visualize', () => {
     expect(r.notice).toMatch(/unusable output/);
   });
 
+  it('truncated output (done_reason=length) -> offline with "cut off" notice', async () => {
+    const d = { config, provider: new OllamaProvider(config, mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER.slice(0, 50), 2, { thinking: 'hmm '.repeat(300), doneReason: 'length' })))) };
+    const r = await visualize('beating red heart', d);
+    expect(r.source).toBe('offline');
+    expect(r.params.shape).toBe('heart');
+    expect(r.notice).toMatch(/Local LLM output was cut off/);
+  });
+
+  it('thinking model with fenced JSON still parses', async () => {
+    const fenced = 'Here you go:\n```json\n' + GOOD_ANSWER + '\n```\nEnjoy!';
+    const d = { config, provider: new OllamaProvider(config, mockFetch(() => ndjsonResponse(ollamaStream(fenced, 6, { thinking: 'reasoning '.repeat(100) })))) };
+    const r = await visualize('galaxy', d);
+    expect(r.source).toBe('llm');
+    expect(r.params.shape).toBe('galaxy');
+  });
+
   it('falls back to offline when unreachable, with a clear notice and no URL leak', async () => {
     const r = await visualize('storm', deps(() => {
       throw new TypeError('ECONNREFUSED 192.168.87.10:11434');
@@ -88,6 +104,9 @@ describe('helpers', () => {
   it('extractJson tolerates fences and chatter', () => {
     expect(extractJson('```json\n{"a":1}\n```')).toEqual({ a: 1 });
     expect(extractJson('Sure! {"a":2} hope that helps')).toEqual({ a: 2 });
+    expect(extractJson('```JSON\n{"a":3}```')).toEqual({ a: 3 });
+    expect(extractJson('```\n{"a":{"b":"x"}}\n```')).toEqual({ a: { b: 'x' } });
+    expect(extractJson('thinking... ok:\n```json {"a":4} ```')).toEqual({ a: 4 });
     expect(() => extractJson('nope')).toThrow();
   });
   it('partialReply reads an incomplete stream', () => {

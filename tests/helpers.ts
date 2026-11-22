@@ -15,13 +15,23 @@ export function ndjsonResponse(chunks: string[], opts: { status?: number; delayM
 }
 
 /** Splits a JSON answer into Ollama /api/chat stream lines. */
-export function ollamaStream(answer: string, pieces = 5): string[] {
-  const size = Math.ceil(answer.length / pieces);
+export function ollamaStream(
+  answer: string,
+  pieces = 5,
+  opts: { thinking?: string; doneReason?: string } = {},
+): string[] {
+  const size = Math.ceil(answer.length / pieces) || 1;
   const lines: string[] = [];
+  if (opts.thinking) {
+    // reasoning models stream `message.thinking` before (and separately from) `content`
+    for (let i = 0; i < opts.thinking.length; i += 40) {
+      lines.push(`${JSON.stringify({ model: 'gemma4:e4b', message: { role: 'assistant', content: '', thinking: opts.thinking.slice(i, i + 40) }, done: false })}\n`);
+    }
+  }
   for (let i = 0; i < answer.length; i += size) {
     lines.push(`${JSON.stringify({ model: 'gemma3:12b', message: { role: 'assistant', content: answer.slice(i, i + size) }, done: false })}\n`);
   }
-  lines.push(`${JSON.stringify({ model: 'gemma3:12b', message: { role: 'assistant', content: '' }, done: true })}\n`);
+  lines.push(`${JSON.stringify({ model: 'gemma3:12b', message: { role: 'assistant', content: '' }, done: true, done_reason: opts.doneReason ?? 'stop' })}\n`);
   return lines;
 }
 

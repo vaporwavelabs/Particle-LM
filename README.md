@@ -31,6 +31,8 @@ browser (React + WebGL2)  ──POST /api/visualize?stream=1──▶  server.ts
   and stripped of control characters, unknown keys dropped. Fields the LLM gets wrong fall back to an offline parse of the same prompt.
 * **Offline mode:** if Ollama is disabled (`LLM_OFFLINE=1`), unreachable, times out, lacks the model, or returns junk, the
   server uses `server/llm/offline.ts` and the UI shows a clear notice. There is no cloud fallback.
+* **Thinking models:** `think:false` is sent by default; `message.thinking` chunks are never treated as answer text;
+  a `done_reason: "length"` reply is reported as truncated ("Local LLM output was cut off") and the offline parser is used.
 * **Read-only to the LLM host:** only `GET /api/tags` and `POST /api/chat` with `LLM_MODEL`. No pulls, no loads/unloads, no `keep_alive`.
 * **Safety:** LLM text is rendered as plain React text only (no `innerHTML`/`dangerouslySetInnerHTML`). In production
   the server sends a self-only CSP (`connect-src 'self'`), `X-Frame-Options: DENY`, `nosniff`, no CORS. Errors never include upstream URLs or stack traces.
@@ -60,6 +62,9 @@ To try it from a phone on the same Wi-Fi, set `HOST=0.0.0.0` and open `http://<t
 | `LLM_FALLBACK_URL` | (none) | second Ollama URL, used only if the first can't be reached (e.g. `http://192.168.87.10:11440`) |
 | `LLM_MODEL` | `gemma3:12b` | must already be installed (`ollama list`) |
 | `LLM_TIMEOUT_MS` | `45000` | per request |
+| `LLM_THINK` | `false` | Ollama `think` flag. `false` disables reasoning on thinking models (e.g. `gemma4:e4b`), whose thinking would otherwise use up the token budget and cut the JSON off. `gemma3:12b` ignores it. `true` allows thinking; `omit` doesn't send the field. If an older Ollama rejects `think` with a 400, the request is retried once without it. |
+| `LLM_NUM_PREDICT` | `600` | max output tokens (`options.num_predict`) |
+| `LLM_TAGS_TIMEOUT_MS` | `6000` | timeout for the `GET /api/tags` status probe |
 | `LLM_OFFLINE` | `0` | `1` = never call the LLM |
 | `PORT` / `HOST` | `3000` / `127.0.0.1` | web server |
 
