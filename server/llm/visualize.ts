@@ -91,7 +91,11 @@ const NOTICES: Record<string, string> = {
   bad_status: 'Local LLM returned an error, so the offline parser was used.',
   bad_output: 'Local LLM returned unusable output, so the offline parser was used.',
   truncated: 'Local LLM output was cut off, so the offline parser was used.',
+  stalled: 'Local LLM is not responding, so the offline parser was used.',
 };
+
+export const MISCONFIGURED_NOTICE =
+  'The LLM is misconfigured (invalid LLM_BASE_URL), so the offline parser was used. Fix .env and restart the server.';
 
 export interface VisualizeDeps {
   config: LlmConfig;
@@ -108,6 +112,9 @@ export async function visualize(input: unknown, deps: VisualizeDeps, opts: Visua
   const offline = parsePromptOffline(prompt);
   const truncNote = truncated ? ` Prompt was shortened to ${LLM_PROMPT_CHARS} characters.` : '';
 
+  if (deps.config.configErrors.length > 0) {
+    return { ...offline, notice: `${MISCONFIGURED_NOTICE}${truncNote}` };
+  }
   if (deps.config.offline) {
     return { ...offline, notice: `Offline mode is on (LLM disabled).${truncNote}` };
   }
@@ -140,7 +147,8 @@ export async function visualize(input: unknown, deps: VisualizeDeps, opts: Visua
     };
   } catch (err) {
     if (err instanceof LlmError && err.code === 'aborted') throw err;
-    const code = err instanceof LlmError ? (err.reason === 'truncated' ? 'truncated' : err.code) : 'bad_output';
+    const code =
+      err instanceof LlmError ? (err.reason === 'truncated' || err.reason === 'stalled' ? err.reason : err.code) : 'bad_output';
     return { ...offline, notice: `${NOTICES[code] ?? NOTICES.bad_output}${truncNote}` };
   }
 }

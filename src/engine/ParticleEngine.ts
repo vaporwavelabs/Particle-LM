@@ -510,9 +510,9 @@ export class ParticleEngine {
     this.mode = m;
   }
 
+  /** Only scales motion; auto-rotate is controlled separately via setAutoRotate (user setting). */
   setReducedMotion(on: boolean): void {
     this.opts.reducedMotion = on;
-    this.autoRotate = !on;
   }
 
   setAutoRotate(on: boolean): void {

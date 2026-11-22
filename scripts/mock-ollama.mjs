@@ -1,9 +1,15 @@
 // Tiny fake Ollama for tests/smoke (GET /api/tags, POST /api/chat streaming).
 import http from 'node:http';
 
-export function startMockOllama(port = 0, { delayMs = 40 } = {}) {
+export function startMockOllama(port = 0, { delayMs = 40, hang = false } = {}) {
   const log = [];
   const server = http.createServer((req, res) => {
+    if (hang) {
+      // accept the connection, never answer (simulates a wedged/asleep Ollama)
+      log.push({ method: req.method, url: req.url, hang: true });
+      req.resume();
+      return;
+    }
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', async () => {

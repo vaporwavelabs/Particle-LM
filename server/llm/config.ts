@@ -10,6 +10,12 @@ export interface LlmConfig {
   numPredict: number;
   /** Timeout for the GET /api/tags health probe. */
   tagsTimeoutMs: number;
+  /** Connect / response-headers timeout per endpoint; a stall here is fallback-eligible. */
+  connectTimeoutMs: number;
+  /** Configuration problems (names of bad env vars only, never their values). Non-empty => LLM disabled. */
+  configErrors: string[];
+  /** Non-fatal configuration warnings. */
+  configWarnings: string[];
 }
 
 export const DEFAULT_BASE_URL = 'http://192.168.87.10:11434';
@@ -28,10 +34,24 @@ function cleanUrl(v: string | undefined): string | undefined {
 }
 
 export function loadLlmConfig(env: Record<string, string | undefined> = process.env): LlmConfig {
+  const configErrors: string[] = [];
+  const configWarnings: string[] = [];
   const timeout = Number(env.LLM_TIMEOUT_MS);
-  const baseUrl = cleanUrl(env.LLM_BASE_URL) ?? DEFAULT_BASE_URL;
-  const fallbackUrl = cleanUrl(env.LLM_FALLBACK_URL);
+  // Unset LLM_BASE_URL -> documented LAN default. Set but invalid -> error + LLM disabled (never a silent default).
+  const baseRaw = env.LLM_BASE_URL?.trim();
+  let baseUrl = DEFAULT_BASE_URL;
+  if (baseRaw) {
+    const cleaned = cleanUrl(baseRaw);
+    if (cleaned) baseUrl = cleaned;
+    else configErrors.push('LLM_BASE_URL is not a valid http(s) URL (credentials are not allowed)');
+  }
+  const fallbackRaw = env.LLM_FALLBACK_URL?.trim();
+  const fallbackUrl = cleanUrl(fallbackRaw);
+  if (fallbackRaw && !fallbackUrl) configWarnings.push('LLM_FALLBACK_URL is not a valid http(s) URL and was ignored');
   const model = (env.LLM_MODEL ?? '').trim();
+  const modelOk = /^[\w.:\-/]{1,100}$/.test(model);
+  if (model && !modelOk) configWarnings.push(`LLM_MODEL is not a valid model name; using ${DEFAULT_MODEL}`);
+  const connectTimeout = Number(env.LLM_CONNECT_TIMEOUT_MS);
   const thinkRaw = (env.LLM_THINK ?? '').trim().toLowerCase();
   const think = thinkRaw === 'true' || thinkRaw === '1' ? true : thinkRaw === 'omit' || thinkRaw === 'unset' ? undefined : false;
   const numPredict = Number(env.LLM_NUM_PREDICT);
@@ -39,11 +59,14 @@ export function loadLlmConfig(env: Record<string, string | undefined> = process.
   return {
     baseUrl,
     fallbackUrl: fallbackUrl && fallbackUrl !== baseUrl ? fallbackUrl : undefined,
-    model: /^[\w.:\-/]{1,100}$/.test(model) ? model : DEFAULT_MODEL,
+    model: modelOk ? model : DEFAULT_MODEL,
     timeoutMs: Number.isFinite(timeout) && timeout >= 1000 ? Math.min(timeout, 180_000) : 45_000,
     offline: env.LLM_OFFLINE === '1' || env.LLM_OFFLINE === 'true',
     think,
     numPredict: Number.isFinite(numPredict) && numPredict >= 64 ? Math.min(Math.round(numPredict), 4096) : 600,
     tagsTimeoutMs: Number.isFinite(tagsTimeout) && tagsTimeout >= 500 ? Math.min(tagsTimeout, 30_000) : 6000,
+    connectTimeoutMs: Number.isFinite(connectTimeout) && connectTimeout >= 100 ? Math.min(connectTimeout, 60_000) : 6000,
+    configErrors,
+    configWarnings,
   };
 }

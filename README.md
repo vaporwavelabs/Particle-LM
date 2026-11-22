@@ -31,6 +31,12 @@ browser (React + WebGL2)  ──POST /api/visualize?stream=1──▶  server.ts
   and stripped of control characters, unknown keys dropped. Fields the LLM gets wrong fall back to an offline parse of the same prompt.
 * **Offline mode:** if Ollama is disabled (`LLM_OFFLINE=1`), unreachable, times out, lacks the model, or returns junk, the
   server uses `server/llm/offline.ts` and the UI shows a clear notice. There is no cloud fallback.
+* **Fallback and status:** `LLM_TIMEOUT_MS` is one budget across both URLs. A primary that refuses the connection or stalls
+  past `LLM_CONNECT_TIMEOUT_MS` is skipped for the fallback, and for the next 30 s prompts go to the fallback first. The
+  status pill reflects what the last chat actually experienced: green only when the primary answers, amber for
+  "Primary stalled/down, using fallback", "LLM not answering", "misconfigured", offline or disabled.
+* **Concurrency:** newest prompt wins per client (an older in-flight prompt from the same IP is cancelled and ends with
+  "Replaced by a newer prompt"); a 429 is retried once by the browser, then shown as a friendly "busy" message.
 * **Thinking models:** `think:false` is sent by default; `message.thinking` chunks are never treated as answer text;
   a `done_reason: "length"` reply is reported as truncated ("Local LLM output was cut off") and the offline parser is used.
 * **Read-only to the LLM host:** only `GET /api/tags` and `POST /api/chat` with `LLM_MODEL`. No pulls, no loads/unloads, no `keep_alive`.
@@ -58,15 +64,17 @@ To try it from a phone on the same Wi-Fi, set `HOST=0.0.0.0` and open `http://<t
 
 | env | default | meaning |
 |---|---|---|
-| `LLM_BASE_URL` | `http://192.168.87.10:11434` | Ollama on the 3090 PC |
+| `LLM_BASE_URL` | `http://192.168.87.10:11434` | Ollama on the 3090 PC (used when unset). An invalid value is a startup CONFIG ERROR: the LLM is disabled and the UI shows a "misconfigured" notice; it never silently falls back to the default. |
 | `LLM_FALLBACK_URL` | (none) | second Ollama URL, used only if the first can't be reached (e.g. `http://192.168.87.10:11440`) |
 | `LLM_MODEL` | `gemma4:e4b` | must already be installed (`ollama list`). `gemma3:12b` also works (non-thinking; Ollama loads it on first use if it isn't loaded). |
 | `LLM_TIMEOUT_MS` | `45000` | per request |
 | `LLM_THINK` | `false` | Ollama `think` flag. `false` disables reasoning on thinking models (e.g. `gemma4:e4b`), whose thinking would otherwise use up the token budget and cut the JSON off. `gemma3:12b` ignores it. `true` allows thinking; `omit` doesn't send the field. If an older Ollama rejects `think` with a 400, the request is retried once without it. |
+| `LLM_CONNECT_TIMEOUT_MS` | `6000` | if an Ollama URL accepts the connection but sends no response headers in time (asleep/wedged), it counts as unreachable: the fallback is tried, or the offline parser is used. After the response starts, failures are final (no fallback). Ollama answers only once the model is loaded, so raise this for cold loads. |
 | `LLM_NUM_PREDICT` | `600` | max output tokens (`options.num_predict`) |
 | `LLM_TAGS_TIMEOUT_MS` | `6000` | timeout for the `GET /api/tags` status probe |
 | `LLM_OFFLINE` | `0` | `1` = never call the LLM |
 | `PORT` / `HOST` | `3000` / `127.0.0.1` | web server |
+| `ALLOWED_HOSTS` | (none) | extra Host-header names to accept (comma separated); loopback, this machine's hostname and interface IPs are always allowed, anything else gets 421 |
 
 ## Checks
 

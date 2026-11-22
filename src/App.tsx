@@ -11,6 +11,7 @@ import {
 } from '../shared/params';
 import { ParticleEngine, type EngineStats, type PointerMode } from './engine/ParticleEngine';
 import { ApiError, fetchStatus, visualizeStream, type LlmStatus } from './lib/api';
+import { describeStatus } from './lib/status';
 
 const isSmallDevice = () =>
   typeof window !== 'undefined' && (matchMedia('(pointer: coarse)').matches || window.innerWidth < 768);
@@ -66,6 +67,7 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<ParticleEngine | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const lastSendRef = useRef({ text: '', at: 0 });
   const small = useRef(isSmallDevice()).current;
   const maxParticles = small ? 60_000 : 150_000;
 
@@ -121,8 +123,11 @@ export default function App() {
   useEffect(() => engineRef.current?.setCount(count), [count]);
   useEffect(() => engineRef.current?.setMode(mode), [mode]);
   useEffect(() => engineRef.current?.setAutoQuality(autoQuality), [autoQuality]);
-  useEffect(() => engineRef.current?.setAutoRotate(autoRotate && !reducedMotion), [autoRotate, reducedMotion]);
-  useEffect(() => engineRef.current?.setReducedMotion(reducedMotion), [reducedMotion]);
+  // Order matters: apply reduced motion first, then the effective auto-rotate (user choice AND not reduced).
+  useEffect(() => {
+    engineRef.current?.setReducedMotion(reducedMotion);
+    engineRef.current?.setAutoRotate(autoRotate && !reducedMotion);
+  }, [autoRotate, reducedMotion]);
 
   useEffect(() => {
     const mq = matchMedia('(prefers-reduced-motion: reduce)');
@@ -171,6 +176,10 @@ export default function App() {
         setReply({ text: 'Type something to visualize first.', error: true });
         return;
       }
+      // Ignore an identical re-submit within 400 ms (double tap / double Enter).
+      const now = performance.now();
+      if (lastSendRef.current.text === trimmed && now - lastSendRef.current.at < 400 && abortRef.current) return;
+      lastSendRef.current = { text: trimmed, at: now };
       abortRef.current?.abort(); // fast repeated sends: newest wins
       const ctrl = new AbortController();
       abortRef.current = ctrl;
@@ -183,8 +192,8 @@ export default function App() {
         if (abortRef.current !== ctrl) return;
         setParams(result.params);
         setReply({ text: result.reply, source: result.source, notice: result.notice });
-        if (result.source === 'offline' && status.mode === 'online') void fetchStatus(true).then(setStatus);
-        if (result.source === 'llm' && status.mode !== 'online') void fetchStatus().then(setStatus);
+        // The server merges what this chat experienced into its status, so re-read it every time.
+        void fetchStatus().then(setStatus);
       } catch (err) {
         if (ctrl.signal.aborted) return;
         setReply({ text: err instanceof ApiError ? err.message : 'Something went wrong.', error: true });
@@ -196,7 +205,7 @@ export default function App() {
         }
       }
     },
-    [status.mode],
+    [],
   );
 
   const onSubmit = (e: FormEvent) => {
@@ -207,18 +216,8 @@ export default function App() {
   const update = <K extends keyof VisualParams>(key: K, value: VisualParams[K]) =>
     setParams((p) => ({ ...p, [key]: value }));
 
-  const statusLabel =
-    status.mode === 'online'
-      ? `Local LLM · ${status.model ?? ''}`
-      : status.mode === 'disabled'
-        ? 'Offline parser (LLM disabled)'
-        : status.mode === 'model-missing'
-          ? `Model missing · ${status.model ?? ''}`
-          : status.mode === 'offline'
-            ? 'Local LLM unreachable · offline parser'
-            : 'Checking local LLM…';
-  const statusColor =
-    status.mode === 'online' ? 'bg-emerald-400' : status.mode === 'unknown' ? 'bg-slate-400' : 'bg-amber-400';
+  const { label: statusLabel, tone } = describeStatus(status);
+  const statusColor = tone === 'green' ? 'bg-emerald-400' : tone === 'grey' ? 'bg-slate-400' : 'bg-amber-400';
 
   return (
     <div className="relative h-full w-full overflow-hidden text-slate-100" style={{ backgroundColor: params.background }}>
@@ -334,15 +333,15 @@ export default function App() {
             </div>
 
             <div className="space-y-2 text-xs text-slate-300">
-              <label className="flex items-center justify-between gap-2">
+              <label className="flex min-h-11 items-center justify-between gap-2">
                 <span>Auto quality (keeps it smooth)</span>
                 <input type="checkbox" checked={autoQuality} onChange={(e) => setAutoQuality(e.target.checked)} />
               </label>
-              <label className="flex items-center justify-between gap-2">
+              <label className="flex min-h-11 items-center justify-between gap-2">
                 <span>Auto-rotate</span>
                 <input type="checkbox" checked={autoRotate} onChange={(e) => setAutoRotate(e.target.checked)} />
               </label>
-              <label className="flex items-center justify-between gap-2">
+              <label className="flex min-h-11 items-center justify-between gap-2">
                 <span>Reduced motion</span>
                 <input type="checkbox" checked={reducedMotion} onChange={(e) => setReducedMotion(e.target.checked)} />
               </label>
@@ -358,7 +357,7 @@ export default function App() {
 
       {/* Prompt dock */}
       <section aria-label="Prompt" className="absolute inset-x-2 bottom-2 mx-auto max-w-2xl space-y-2 sm:bottom-4">
-        <div className="no-scrollbar flex gap-1.5 overflow-x-auto pb-0.5">
+        <div className="no-scrollbar chip-row flex gap-1.5 overflow-x-auto pb-0.5" aria-label="Presets">
           {PRESETS.map((p) => (
             <button
               key={p.id}
@@ -376,6 +375,11 @@ export default function App() {
         </div>
 
         <div className="rounded-2xl bg-black/60 p-2 backdrop-blur-md">
+          {status.mode === 'misconfigured' && status.notice && (
+            <p role="alert" className="px-2 pb-1 text-[11px] text-amber-300" data-testid="config-notice">
+              {status.notice}
+            </p>
+          )}
           <p
             className={`min-h-[2.5rem] whitespace-pre-wrap break-words px-2 py-1 text-sm ${reply.error ? 'text-amber-300' : 'text-slate-100'}`}
             aria-live="polite"

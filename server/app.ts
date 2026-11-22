@@ -1,8 +1,9 @@
+import os from 'node:os';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { MAX_PROMPT_CHARS } from '../shared/params.ts';
 import type { LlmConfig } from './llm/config.ts';
 import { LlmError, OllamaProvider } from './llm/ollama.ts';
-import { PromptError, visualize } from './llm/visualize.ts';
+import { MISCONFIGURED_NOTICE, PromptError, visualize } from './llm/visualize.ts';
 
 export interface AppOptions {
   config: LlmConfig;
@@ -10,6 +11,26 @@ export interface AppOptions {
   production?: boolean;
   maxInFlight?: number;
   ratePerMinute?: number;
+  /** Extra hostnames allowed in the Host header (env ALLOWED_HOSTS, comma separated). */
+  allowedHosts?: string[];
+}
+
+/** Hostnames this server answers to: loopback, this machine's interface IPs, its hostname, plus extras. */
+export function buildHostAllowlist(extra: string[] = []): Set<string> {
+  const set = new Set(['localhost', '127.0.0.1', '::1', os.hostname().toLowerCase()]);
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list ?? []) set.add(ni.address.toLowerCase().replace(/%.*$/, ''));
+  }
+  for (const h of extra) if (h.trim()) set.add(h.trim().toLowerCase());
+  return set;
+}
+
+/** Strips the port (and IPv6 brackets) from a Host header value. */
+export function hostnameOf(hostHeader: string | undefined): string {
+  if (!hostHeader) return '';
+  const h = hostHeader.trim().toLowerCase();
+  if (h.startsWith('[')) return h.slice(1, h.indexOf(']') > 0 ? h.indexOf(']') : undefined);
+  return h.replace(/:\d+$/, '');
 }
 
 export const CSP = [
@@ -32,10 +53,22 @@ export function createApp(opts: AppOptions) {
   const ratePerMinute = opts.ratePerMinute ?? 40;
   let inFlight = 0;
   const hits = new Map<string, number[]>();
+  const allowHosts = buildHostAllowlist(opts.allowedHosts);
+  // Newest-wins per client: a new prompt from the same client replaces its in-flight one.
+  const active = new Map<string, Set<AbortController>>();
 
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', false);
+
+  // DNS-rebinding guard: only answer to known hostnames.
+  app.use((req, res, next) => {
+    const h = hostnameOf(req.headers.host);
+    if (!allowHosts.has(h) && !h.endsWith('.localhost')) {
+      return res.status(421).type('text/plain').send('Host not allowed. Add it to ALLOWED_HOSTS.');
+    }
+    next();
+  });
 
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -53,16 +86,22 @@ export function createApp(opts: AppOptions) {
   });
 
   // Deliberately exposes no URLs: only mode + model name.
+  // Deliberately exposes no URLs: only mode + model name + which endpoint answered.
   app.get('/api/llm/status', async (req, res) => {
+    if (opts.config.configErrors.length) {
+      return res.json({ mode: 'misconfigured', model: opts.config.model, notice: MISCONFIGURED_NOTICE });
+    }
     if (opts.config.offline) {
       return res.json({ mode: 'disabled', model: opts.config.model });
     }
     const s = await provider.status(req.query.refresh === '1');
-    res.json({
-      mode: s.reachable ? (s.modelInstalled ? 'online' : 'model-missing') : 'offline',
-      model: opts.config.model,
-      via: s.via,
-    });
+    let mode: string;
+    if (!s.reachable) mode = 'offline';
+    else if (!s.modelInstalled) mode = 'model-missing';
+    else if (s.lastChat === 'failed') mode = 'failing';
+    else if (s.via === 'fallback') mode = 'fallback';
+    else mode = 'online';
+    res.json({ mode, model: opts.config.model, via: s.via, primary: s.primary });
   });
 
   app.post('/api/visualize', async (req: Request, res: Response) => {
@@ -83,10 +122,20 @@ export function createApp(opts: AppOptions) {
       if (!res.writableEnded) controller.abort();
     });
 
+    // Supersede this client's older in-flight prompt(s), then wait briefly for a free slot.
+    const mine = active.get(ip) ?? new Set<AbortController>();
+    for (const c of mine) c.abort('superseded');
+    const waitUntil = Date.now() + 2000;
+    while (inFlight >= maxInFlight && Date.now() < waitUntil && !controller.signal.aborted) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    if (controller.signal.aborted) return;
     if (inFlight >= maxInFlight) {
       return res.status(429).json({ error: 'The local LLM is busy, try again in a moment.' });
     }
     inFlight++;
+    mine.add(controller);
+    active.set(ip, mine);
     try {
       if (!stream) {
         const result = await visualize(prompt, { config: opts.config, provider }, { signal: controller.signal });
@@ -124,7 +173,13 @@ export function createApp(opts: AppOptions) {
       res.end();
     } catch (err) {
       if (err instanceof LlmError && err.code === 'aborted') {
-        if (!res.writableEnded) res.end();
+        const superseded = controller.signal.reason === 'superseded';
+        if (!res.writableEnded && !res.destroyed) {
+          if (res.headersSent) {
+            if (superseded) res.write(`${JSON.stringify({ type: 'error', message: 'Replaced by a newer prompt.' })}\n`);
+            res.end();
+          } else res.status(409).json({ error: 'Replaced by a newer prompt.' });
+        }
         return;
       }
       const status = err instanceof PromptError ? err.status : 500;
@@ -137,6 +192,8 @@ export function createApp(opts: AppOptions) {
       }
     } finally {
       inFlight--;
+      mine.delete(controller);
+      if (mine.size === 0) active.delete(ip);
     }
   });
 

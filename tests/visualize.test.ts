@@ -71,6 +71,25 @@ describe('visualize', () => {
     expect(JSON.stringify(r)).not.toMatch(/192\.168|11434|primary\.test|ECONN/);
   });
 
+  it('stalled primary with no fallback -> offline with "not responding" notice', async () => {
+    const c = loadLlmConfig({ LLM_BASE_URL: 'http://primary.test:11434', LLM_CONNECT_TIMEOUT_MS: '300' });
+    const f = mockFetch((_u, init) => new Promise<Response>((_r, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('abort')))));
+    const t0 = Date.now();
+    const r = await visualize('heart', { config: c, provider: new OllamaProvider(c, f) });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(r.source).toBe('offline');
+    expect(r.notice).toMatch(/not responding/);
+  });
+
+  it('invalid LLM_BASE_URL -> offline parser with a clear misconfiguration notice, no network', async () => {
+    const c = loadLlmConfig({ LLM_BASE_URL: 'htp:/oops' });
+    const f = mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER)));
+    const r = await visualize('heart', { config: c, provider: new OllamaProvider(c, f) });
+    expect(r.source).toBe('offline');
+    expect(r.notice).toMatch(/misconfigured \(invalid LLM_BASE_URL\)/);
+    expect(f.calls).toHaveLength(0);
+  });
+
   it('never calls the LLM when LLM_OFFLINE=1', async () => {
     const off = loadLlmConfig({ LLM_OFFLINE: '1' });
     const f = mockFetch(() => ndjsonResponse(ollamaStream(GOOD_ANSWER)));

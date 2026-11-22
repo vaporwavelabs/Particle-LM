@@ -86,3 +86,19 @@ input[type="range"].plm-range::-moz-range-thumb { width: 16px; height: 16px; bor
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* 24px touch-friendly checkboxes */
+input[type="checkbox"] {
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+  accent-color: #67e8f9;
+  cursor: pointer;
+}
+
+/* fade the right edge of the preset row so it reads as scrollable */
+.chip-row {
+  -webkit-mask-image: linear-gradient(to right, #000 85%, transparent);
+  mask-image: linear-gradient(to right, #000 85%, transparent);
+  padding-right: 2rem;
+}

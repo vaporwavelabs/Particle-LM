@@ -13,7 +13,12 @@ const production = process.env.NODE_ENV === 'production' || process.argv.include
 
 async function main() {
   const config = loadLlmConfig();
-  const { app } = createApp({ config, production });
+  for (const e of config.configErrors) {
+    console.error(`\n[particle-lm] CONFIG ERROR: ${e}. The LLM is DISABLED; prompts use the offline parser until .env is fixed and the server restarted.\n`);
+  }
+  for (const w of config.configWarnings) console.warn(`[particle-lm] config warning: ${w}`);
+  const allowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim()).filter(Boolean);
+  const { app } = createApp({ config, production, allowedHosts });
   const httpServer = http.createServer(app);
 
   if (!production) {
@@ -32,7 +37,7 @@ async function main() {
   httpServer.listen(PORT, HOST, () => {
     // Log the model and mode only (no upstream URLs in logs that may be shared).
     console.log(
-      `Particle-LM on http://${HOST}:${PORT}  model=${config.model}  llm=${config.offline ? 'disabled (offline parser)' : 'local Ollama'}${config.fallbackUrl ? ' (+fallback)' : ''}`,
+      `Particle-LM on http://${HOST}:${PORT}  model=${config.model}  llm=${config.configErrors.length ? 'MISCONFIGURED (offline parser)' : config.offline ? 'disabled (offline parser)' : 'local Ollama'}${config.fallbackUrl ? ' (+fallback)' : ''}`,
     );
   });
 }

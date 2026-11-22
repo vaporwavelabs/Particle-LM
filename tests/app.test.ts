@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net';
-import type { Server } from 'node:http';
+import http, { type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CSP, createApp } from '../server/app.ts';
 import { loadLlmConfig } from '../server/llm/config.ts';
@@ -9,10 +9,18 @@ import { GOOD_ANSWER, mockFetch, ndjsonResponse, ollamaStream } from './helpers.
 let server: Server | undefined;
 afterEach(() => server?.close());
 
-async function start(handler: Parameters<typeof mockFetch>[0], extra: { production?: boolean; offline?: boolean } = {}) {
-  const config = loadLlmConfig({ LLM_BASE_URL: 'http://10.9.8.7:11434', LLM_OFFLINE: extra.offline ? '1' : '0' });
+async function start(
+  handler: Parameters<typeof mockFetch>[0],
+  extra: { production?: boolean; offline?: boolean; env?: Record<string, string>; allowedHosts?: string[] } = {},
+) {
+  const config = loadLlmConfig({ LLM_BASE_URL: 'http://10.9.8.7:11434', LLM_OFFLINE: extra.offline ? '1' : '0', ...extra.env });
   const f = mockFetch(handler);
-  const { app } = createApp({ config, provider: new OllamaProvider(config, f), production: extra.production });
+  const { app } = createApp({
+    config,
+    provider: new OllamaProvider(config, f),
+    production: extra.production,
+    allowedHosts: extra.allowedHosts,
+  });
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server!.once('listening', r));
   const base = `http://127.0.0.1:${(server!.address() as AddressInfo).port}`;
@@ -113,5 +121,76 @@ describe('HTTP API', () => {
     expect(r.source).toBe('offline');
     expect((await (await fetch(`${base}/api/llm/status`)).json()).mode).toBe('disabled');
     expect(f.calls).toHaveLength(0);
+  });
+
+  it('status is amber "fallback" with primary stalled when the primary hangs', async () => {
+    const hang = (init?: RequestInit) =>
+      new Promise<Response>((_r, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('abort'))));
+    const { base } = await start(
+      (url, init) => (url.startsWith('http://10.9.8.7') ? hang(init) : url.endsWith('/api/tags') ? Response.json({ models: [{ name: 'gemma4:e4b' }] }) : ndjsonResponse(ollamaStream(GOOD_ANSWER))),
+      { env: { LLM_FALLBACK_URL: 'http://10.9.8.8:11440', LLM_CONNECT_TIMEOUT_MS: '300', LLM_TAGS_TIMEOUT_MS: '500' } },
+    );
+    const st = await (await fetch(`${base}/api/llm/status?refresh=1`)).json();
+    expect(st).toMatchObject({ mode: 'fallback', via: 'fallback', primary: 'stalled' });
+    const t0 = Date.now();
+    const r = await (await fetch(`${base}/api/visualize`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"prompt":"heart"}' })).json();
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(r.source).toBe('llm');
+  });
+
+  it('status is "failing" (not green) after a chat failed on all endpoints', async () => {
+    const { base } = await start(
+      (url, init) =>
+        url.endsWith('/api/tags')
+          ? Response.json({ models: [{ name: 'gemma4:e4b' }] })
+          : new Promise<Response>((_r, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('abort')))),
+      { env: { LLM_CONNECT_TIMEOUT_MS: '300' } },
+    );
+    expect((await (await fetch(`${base}/api/llm/status?refresh=1`)).json()).mode).toBe('online');
+    const r = await (await fetch(`${base}/api/visualize`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"prompt":"heart"}' })).json();
+    expect(r.notice).toMatch(/not responding/);
+    expect((await (await fetch(`${base}/api/llm/status`)).json())).toMatchObject({ mode: 'failing', primary: 'stalled' });
+  });
+
+  it('invalid LLM_BASE_URL -> status "misconfigured" with a notice, no network', async () => {
+    const { base, f } = await start(() => Response.json({ models: [] }), { env: { LLM_BASE_URL: 'nope://x' } });
+    const st = await (await fetch(`${base}/api/llm/status`)).json();
+    expect(st.mode).toBe('misconfigured');
+    expect(st.notice).toMatch(/LLM_BASE_URL/);
+    expect(JSON.stringify(st)).not.toMatch(/nope:/);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it('two sends at once from one client: newest wins, never a 429', async () => {
+    const { base } = await start(() => ndjsonResponse(ollamaStream(GOOD_ANSWER, 10), { delayMs: 80 }));
+    const send = () =>
+      fetch(`${base}/api/visualize?stream=1`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'galaxy' }),
+      }).then(async (r) => ({ status: r.status, text: await r.text() }));
+    const results = await Promise.all([send(), send(), send()]);
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200]);
+    const finals = results.map((r) => r.text.trim().split('\n').map((l) => JSON.parse(l)).at(-1));
+    expect(finals.filter((e) => e.type === 'result')).toHaveLength(1);
+    expect(finals.filter((e) => e.type === 'error').every((e) => e.message === 'Replaced by a newer prompt.')).toBe(true);
+  });
+
+  it('Host allowlist: foreign Host gets 421, loopback / ALLOWED_HOSTS pass', async () => {
+    const { base } = await start(() => Response.json({ models: [] }), { allowedHosts: ['particles.lan'] });
+    const port = new URL(base).port;
+    const get = (host: string) =>
+      new Promise<number>((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port, path: '/api/health', headers: { Host: host } }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        }).on('error', reject);
+      });
+    expect(await get('evil.example')).toBe(421);
+    expect(await get('evil.example:3000')).toBe(421);
+    expect(await get(`127.0.0.1:${port}`)).toBe(200);
+    expect(await get(`localhost:${port}`)).toBe(200);
+    expect(await get('[::1]:3000')).toBe(200);
+    expect(await get('particles.lan:3000')).toBe(200);
   });
 });

@@ -77,7 +77,7 @@ function watch(page, origin, label) {
   return { bad, errors, label };
 }
 
-const mock = await startMockOllama(0);
+const mock = await startMockOllama(Number(process.env.SMOKE_MOCK_PORT || 0));
 const PORT = Number(process.env.SMOKE_PORT || 3901);
 const srv = await startServer(PORT, { LLM_BASE_URL: `http://127.0.0.1:${mock.port}`, LLM_MODEL: 'gemma3:12b' });
 const origin = `http://127.0.0.1:${PORT}`;
@@ -164,6 +164,17 @@ try {
   await waitDone(page);
   check('desktop: rapid repeated sends settle cleanly', /galaxy|heart/i.test(await page.textContent('[data-testid=reply]')));
 
+  // two sends in the same tick (double Enter): no busy/raw error
+  await page.fill('#prompt', 'galaxy');
+  await page.evaluate(() => {
+    const f = document.querySelector('form');
+    f.requestSubmit();
+    f.requestSubmit();
+  });
+  await waitDone(page);
+  const dbl = await page.textContent('[data-testid=reply]');
+  check('desktop: double submit settles without a busy/raw error', /galaxy/i.test(dbl) && !/busy|failed|\(4\d\d\)/i.test(dbl), dbl.trim());
+
   // XSS attempt typed by a user is shown as text only
   const xssBefore = await page.evaluate(() => document.querySelectorAll('img,script').length);
   await page.fill('#prompt', '<img src=x onerror="window.__xss=1"><script>window.__xss=2</script>');
@@ -232,6 +243,8 @@ try {
   await m.tap('button[aria-controls=controls-panel]');
   await m.waitForTimeout(300);
   await m.screenshot({ path: `${SHOTS}mobile-controls.png` });
+  const cb = await m.evaluate(() => [...document.querySelectorAll('input[type=checkbox]')].map((e) => Math.round(e.getBoundingClientRect().width)));
+  check('mobile: checkboxes are >= 24px touch targets', cb.length > 0 && cb.every((w) => w >= 24), JSON.stringify(cb));
   const overflowM = await m.evaluate(() => document.documentElement.scrollWidth > innerWidth || document.body.scrollWidth > innerWidth);
   check('mobile: no horizontal overflow', !overflowM);
   const blocked = await m.evaluate(() => {
@@ -276,9 +289,52 @@ try {
   check('a11y: prefers-reduced-motion respected', rm);
   await rctx.close();
 
-  // ---------- LLM unreachable ----------
+  // ---------- Primary stalls, fallback healthy ----------
   srv.proc.kill();
-  const down = await startServer(PORT, { LLM_BASE_URL: 'http://127.0.0.1:9' });
+  const hangMock = await startMockOllama(Number(process.env.SMOKE_HANG_PORT || 0), { hang: true });
+  const stallSrv = await startServer(PORT, {
+    LLM_BASE_URL: `http://127.0.0.1:${hangMock.port}`,
+    LLM_FALLBACK_URL: `http://127.0.0.1:${mock.port}`,
+    LLM_MODEL: 'gemma3:12b',
+    LLM_CONNECT_TIMEOUT_MS: '1500',
+    LLM_TAGS_TIMEOUT_MS: '1500',
+  });
+  const sctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const sp = await sctx.newPage();
+  await sp.goto(origin, { waitUntil: 'networkidle' });
+  await sp.waitForFunction(() => /stalled/.test(document.querySelector('[data-testid=llm-status]')?.textContent ?? ''), null, { timeout: 10000 });
+  const stallPill = await sp.textContent('[data-testid=llm-status]');
+  const pillColor = await sp.evaluate(() => document.querySelector('[data-testid=llm-status]').previousElementSibling.className);
+  check('stalled primary: amber pill says primary stalled, using fallback', /Primary stalled, using fallback/.test(stallPill) && /amber/.test(pillColor), stallPill);
+  const ts0 = Date.now();
+  await sp.fill('#prompt', 'heart');
+  await sp.press('#prompt', 'Enter');
+  await waitDone(sp, 15000);
+  const stallMs = Date.now() - ts0;
+  const stallSrc = await sp.textContent('[data-testid=source]');
+  check('stalled primary: prompt served by fallback within connect timeout', /local llm/i.test(stallSrc) && stallMs < 6000, `${stallMs} ms`);
+  await sp.screenshot({ path: `${SHOTS}desktop-stalled-primary.png` });
+  await sctx.close();
+  stallSrv.proc.kill();
+  hangMock.server.closeAllConnections?.();
+  hangMock.server.close();
+
+  // ---------- Invalid LLM_BASE_URL ----------
+  const badSrv = await startServer(PORT, { LLM_BASE_URL: 'htp:/not-a-url' });
+  const badLog = badSrv.logs();
+  check('misconfigured: loud startup error in server log', /CONFIG ERROR: LLM_BASE_URL/.test(badLog), badLog.split('\n').find((l) => /CONFIG ERROR/.test(l)));
+  const bctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const bp = await bctx.newPage();
+  await bp.goto(origin, { waitUntil: 'networkidle' });
+  await bp.waitForSelector('[data-testid=config-notice]', { timeout: 8000 });
+  check('misconfigured: UI notice + amber pill', /LLM_BASE_URL/.test(await bp.textContent('[data-testid=config-notice]')) && /misconfigured/.test(await bp.textContent('[data-testid=llm-status]')));
+  await bp.screenshot({ path: `${SHOTS}mobile-misconfigured.png` });
+  await bctx.close();
+  badSrv.proc.kill();
+
+  // ---------- LLM unreachable ----------
+  const DOWN_PORT = Number(process.env.SMOKE_DOWN_PORT || 9);
+  const down = await startServer(PORT, { LLM_BASE_URL: `http://127.0.0.1:${DOWN_PORT}` });
   const octx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const o = await octx.newPage();
   const ow = watch(o, origin, 'offline');
@@ -289,7 +345,7 @@ try {
   const notice = await o.textContent('[data-testid=notice]');
   const pageText = await o.textContent('body');
   check('offline: clear notice, offline parser used', /unreachable/.test(notice) && /offline/i.test(await o.textContent('[data-testid=source]')), notice);
-  check('offline: no URL/stack leaked to the page', !/127\.0\.0\.1:9|11434|ECONN|at \S+\.ts/.test(pageText));
+  check('offline: no URL/stack leaked to the page', !new RegExp(`127\\.0\\.0\\.1:${DOWN_PORT}\\b|11434|ECONN|at \\S+\\.ts`).test(pageText));
   await o.waitForTimeout(1200);
   await o.screenshot({ path: `${SHOTS}desktop-offline.png` });
   check('offline: all requests same-origin', ow.bad.length === 0);
