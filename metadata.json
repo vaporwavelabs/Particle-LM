@@ -1,0 +1,6 @@
+{
+  "name": "Kinetix Chant",
+  "description": "High-performance WebGL2 GPU particle fluid engine with voice chant FFT reactivity, Gemini TTS synthesized speech feedback, and AI-driven MCP shader mutation.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
