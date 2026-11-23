@@ -1,673 +1,700 @@
-import {
-  AudioMetrics,
-  DEFAULT_COLOR_CODE,
-  DEFAULT_FORCE_CODE,
-  FormationId,
-  PhysicsConfig,
-} from '../types/simulation';
-import { buildFormationTargets } from './formations';
+import { BEHAVIORS, hexToRgb, type VisualParams } from '../../shared/params';
+import { buildShapeTargets } from './shapes';
 
-const MAX_PARTICLES = 65536;
+export type PointerMode = 'attract' | 'repel' | 'swirl' | 'orbit';
 
-function hexToRgbTuple(hex: string): [number, number, number] {
-  const clean = hex.replace('#', '');
-  if (clean.length !== 6) return [0.024, 0.714, 0.831];
-  const r = parseInt(clean.slice(0, 2), 16) / 255;
-  const g = parseInt(clean.slice(2, 4), 16) / 255;
-  const b = parseInt(clean.slice(4, 6), 16) / 255;
-  return [r, g, b];
+export interface EngineStats {
+  fps: number;
+  count: number;
+  targetCount: number;
 }
 
-function buildUpdateVertexShader(customForceGlsl: string): string {
-  return `#version 300 es
+export interface EngineOptions {
+  maxParticles: number;
+  initialCount: number;
+  autoQuality: boolean;
+  reducedMotion: boolean;
+  onStats?: (s: EngineStats) => void;
+  onContextChange?: (lost: boolean) => void;
+}
+
+const UPDATE_VS = `#version 300 es
 precision highp float;
+layout(location=0) in vec4 aPos;   // xyz + seed
+layout(location=1) in vec4 aVel;   // xyz + phase
+layout(location=2) in vec3 aTarget;
+out vec4 vPos;
+out vec4 vVel;
+uniform float uTime, uDt, uTurb, uShapeStrength, uForce, uRadius, uAspect, uFocal, uCamDist;
+uniform int uBehavior;
+uniform mat3 uRot;
+uniform vec2 uPointer, uPointerVel;
+uniform float uPointerDown, uPointerHover;
+uniform int uMode;
 
-layout(location = 0) in vec4 aPosEnergy;
-layout(location = 1) in vec4 aVelSeed;
-layout(location = 2) in vec3 aTarget;
-
-out vec4 vPosEnergy;
-out vec4 vVelSeed;
-
-uniform float uTime;
-uniform float uDt;
-uniform float uAspect;
-uniform vec2 uCursor;
-uniform vec2 uCursorVel;
-uniform float uCursorDown;
-uniform vec4 uAudio;
-uniform float uCurlStrength;
-uniform float uViscosity;
-uniform float uCursorRadius;
-uniform float uCursorForce;
-uniform float uMorphStrength;
-uniform float uAudioSensitivity;
-
-// 3D Simplex Noise for divergence-free curl fluid advection
-vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
-vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
-vec4 permute(vec4 x) { return mod289(((x * 34.0) + 1.0) * x); }
-vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
-
-float snoise(vec3 v) {
-  const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
-  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
-  vec3 i  = floor(v + dot(v, C.yyy));
-  vec3 x0 = v - i + dot(i, C.xxx);
-  vec3 g = step(x0.yzx, x0.xyz);
-  vec3 l = 1.0 - g;
-  vec3 i1 = min(g.xyz, l.zxy);
-  vec3 i2 = max(g.xyz, l.zxy);
-  vec3 x1 = x0 - i1 + C.xxx;
-  vec3 x2 = x0 - i2 + C.yyy;
-  vec3 x3 = x0 - D.yyy;
-  i = mod289(i);
-  vec4 p = permute(permute(permute(
-    i.z + vec4(0.0, i1.z, i2.z, 1.0))
-    + i.y + vec4(0.0, i1.y, i2.y, 1.0))
-    + i.x + vec4(0.0, i1.x, i2.x, 1.0));
-  float n_ = 0.142857142857;
-  vec3 ns = n_ * D.wyz - D.xzx;
-  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
-  vec4 x_ = floor(j * ns.z);
-  vec4 y_ = floor(j - 7.0 * x_);
-  vec4 x = x_ * ns.x + ns.yyyy;
-  vec4 y = y_ * ns.x + ns.yyyy;
-  vec4 h = 1.0 - abs(x) - abs(y);
-  vec4 b0 = vec4(x.xy, y.xy);
-  vec4 b1 = vec4(x.zw, y.zw);
-  vec4 s0 = floor(b0) * 2.0 + 1.0;
-  vec4 s1 = floor(b1) * 2.0 + 1.0;
-  vec4 sh = -step(h, vec4(0.0));
-  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
-  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
-  vec3 p0 = vec3(a0.xy, h.x);
-  vec3 p1 = vec3(a0.zw, h.y);
-  vec3 p2 = vec3(a1.xy, h.z);
-  vec3 p3 = vec3(a1.zw, h.w);
-  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
-  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
-  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
-  m = m * m;
-  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+vec3 flowField(vec3 p, float t) {
+  // Cheap divergence-free field: each component ignores its own axis.
+  return vec3(
+    sin(p.y * 1.7 + t) + sin(p.z * 2.3 - t * 0.7),
+    sin(p.z * 1.9 + t * 0.8) + sin(p.x * 2.1 + t * 0.5),
+    sin(p.x * 1.5 - t * 0.6) + sin(p.y * 2.7 + t * 0.9)
+  ) * 0.5;
 }
 
-vec3 curlNoise(vec3 p) {
-  float e = 0.08;
-  float n1 = snoise(vec3(p.x, p.y + e, p.z));
-  float n2 = snoise(vec3(p.x, p.y - e, p.z));
-  float n3 = snoise(vec3(p.x, p.y, p.z + e));
-  float n4 = snoise(vec3(p.x, p.y, p.z - e));
-  float n5 = snoise(vec3(p.x + e, p.y, p.z));
-  float n6 = snoise(vec3(p.x - e, p.y, p.z));
-  float x = (n1 - n2) - (n3 - n4);
-  float y = (n3 - n4) - (n5 - n6);
-  float z = (n5 - n6) - (n1 - n2);
-  return normalize(vec3(x, y, z) + vec3(0.0001));
-}
-
-${customForceGlsl}
+mat3 rotY(float a) { float c = cos(a), s = sin(a); return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c); }
 
 void main() {
-  vec3 pos = aPosEnergy.xyz;
-  float energy = aPosEnergy.w;
-  vec3 vel = aVelSeed.xyz;
-  float seed = aVelSeed.w;
+  vec3 pos = aPos.xyz; float seed = aPos.w;
+  vec3 vel = aVel.xyz; float phase = aVel.w;
+  float t = uTime;
+  vec3 target = aTarget;
+  float spring = 4.0;
+  float turb = uTurb;
+  vec3 extra = vec3(0.0);
 
-  vec4 scaledAudio = uAudio * uAudioSensitivity;
+  if (uBehavior == 1) {            // swirl
+    target = rotY(t * 0.9) * target;
+    vec3 tang = vec3(-pos.z, 0.0, pos.x);
+    extra += tang * 0.9 + vec3(0.0, 0.25 * sin(t + seed * 6.28), 0.0);
+  } else if (uBehavior == 2) {     // storm
+    turb = turb * 2.2 + 0.6;
+    spring = 2.0;
+    float jolt = step(0.985, fract(sin(floor(t * 3.0) * 12.9898 + seed * 78.233) * 43758.5453));
+    extra += normalize(vec3(sin(seed * 91.0), cos(seed * 47.0), sin(seed * 13.0)) + 0.0001) * jolt * 14.0;
+  } else if (uBehavior == 3) {     // pulse (heartbeat)
+    float ph = fract(t * 1.1);
+    float beat = exp(-pow(ph * 10.0 - 1.0, 2.0)) + 0.6 * exp(-pow(ph * 10.0 - 3.2, 2.0));
+    target *= 1.0 + 0.16 * beat;
+    spring = 7.0;
+  } else if (uBehavior == 4) {     // explode
+    float ph = fract(t * 0.2);
+    float burst = exp(-pow((ph - 0.12) * 7.0, 2.0));
+    vec3 dir = normalize(target + vec3(sin(seed * 31.0), cos(seed * 17.0), sin(seed * 7.0)) * 0.4 + 0.0001);
+    target += dir * burst * (1.6 + fract(seed * 13.0) * 1.4);
+    spring = 3.0 + (1.0 - burst) * 2.0;
+  } else if (uBehavior == 5) {     // orbit
+    target = rotY(t * 0.35) * target;
+  } else if (uBehavior == 6) {     // flow
+    target.y += sin(target.x * 2.5 + t * 1.6) * 0.18 + cos(target.z * 2.0 + t * 1.1) * 0.12;
+    extra += vec3(0.25, 0.0, 0.1);
+  } else if (uBehavior == 7) {     // calm
+    turb *= 0.35;
+    spring = 2.5;
+  }
 
-  // Curl-noise fluid field modulated by voice cadence
-  float freq = 0.85 + scaledAudio.y * 0.45;
-  vec3 curl = curlNoise(pos * freq + vec3(uTime * 0.14, -uTime * 0.09, uTime * 0.11));
-  vec3 fluidAccel = curl * (uCurlStrength + scaledAudio.x * 1.45);
+  vec3 acc = (target - pos) * spring * uShapeStrength;
+  acc += flowField(pos * 1.3 + seed * 0.3, t * 0.6) * turb * 1.6;
+  acc += extra;
 
-  // Cursor interaction in view-plane space
-  vec2 cursorWorld = vec2(uCursor.x * uAspect * 1.45, uCursor.y * 1.45);
-  vec2 toCursor = cursorWorld - pos.xy;
-  float dist = length(toCursor);
-  float influence = smoothstep(uCursorRadius, 0.0, dist);
-
-  vec3 cursorAccel = vec3(0.0);
-  if (influence > 0.001) {
-    vec2 dir = toCursor / (dist + 0.0001);
-    vec2 swirl = vec2(-dir.y, dir.x);
-    // Wake from cursor movement + vortex swirl + click attract/repel
-    cursorAccel.xy += uCursorVel * influence * uCursorForce * 16.0;
-    cursorAccel.xy += swirl * influence * uCursorForce * 1.4;
-    if (abs(uCursorDown) > 0.1) {
-      cursorAccel.xy += dir * uCursorDown * influence * uCursorForce * 3.4;
-      cursorAccel.z += uCursorDown * influence * 0.9;
-    } else {
-      cursorAccel.z += influence * sin(uTime * 6.0 + dist * 10.0) * 0.45;
+  // Pointer interaction in screen space, applied in view space then rotated back to world.
+  if (uPointerDown > 0.0 || uPointerHover > 0.0) {
+    vec3 v = uRot * pos;
+    float w = max(uCamDist - v.z, 0.2);
+    vec2 ndc = v.xy * uFocal / w / vec2(uAspect, 1.0);
+    vec2 d = (uPointer - ndc) * vec2(uAspect, 1.0) * w / uFocal;
+    float dist = length(d);
+    float infl = smoothstep(uRadius, 0.0, dist);
+    if (infl > 0.0) {
+      vec2 dir = d / (dist + 0.0001);
+      vec3 f = vec3(0.0);
+      if (uPointerDown > 0.0) {
+        if (uMode == 0) f = vec3(dir, 0.0) * 9.0;
+        else if (uMode == 1) f = vec3(-dir, 0.4 * sin(seed * 20.0)) * 11.0;
+        else if (uMode == 2) f = vec3(-dir.y, dir.x, 0.0) * 10.0 + vec3(dir, 0.0) * 2.0;
+      }
+      f.xy += uPointerVel * 6.0 * (uPointerDown > 0.0 ? 1.0 : uPointerHover);
+      acc += transpose(uRot) * f * infl * uForce;
     }
   }
 
-  // Morphing attraction toward target shape (mitigated during high cursor wake)
-  vec3 morphAccel = (aTarget - pos) * uMorphStrength * 5.2;
+  // Soft containment.
+  float r = length(pos);
+  acc -= pos * smoothstep(2.4, 4.0, r) * 4.0;
 
-  // Center containment spring so fluid particles never drift off-screen permanently
-  float boundR = length(pos);
-  vec3 containAccel = -pos * smoothstep(1.35, 2.5, boundR) * 1.65;
-
-  // AI/MCP Hot-Swappable Custom Force
-  vec3 mcpAccel = customForce(pos, vel, uTime, scaledAudio, uCursor, uCursorDown, seed);
-
-  vel += (fluidAccel + cursorAccel + morphAccel + containAccel + mcpAccel) * uDt;
-  vel *= pow(uViscosity, uDt * 60.0);
-
-  // Clamp extreme velocities for numerical stability
-  float speed = length(vel);
-  if (speed > 4.5) {
-    vel = (vel / speed) * 4.5;
-  }
-
+  vel += acc * uDt;
+  vel *= exp(-uDt * 2.2);
+  float sp = length(vel);
+  if (sp > 6.0) vel *= 6.0 / sp;
   pos += vel * uDt;
 
-  float nextEnergy = clamp(mix(energy, speed * 0.55 + influence * 0.65 + scaledAudio.w * 0.6, 0.12), 0.0, 1.0);
-
-  vPosEnergy = vec4(pos, nextEnergy);
-  vVelSeed = vec4(vel, seed);
+  vPos = vec4(pos, seed);
+  vVel = vec4(vel, phase);
   gl_Position = vec4(0.0);
 }`;
-}
 
-const UPDATE_FRAGMENT_SHADER = `#version 300 es
+const UPDATE_FS = `#version 300 es
+precision mediump float;
+out vec4 o;
+void main() { o = vec4(0.0); }`;
+
+const RENDER_VS = `#version 300 es
 precision highp float;
-out vec4 fragColor;
+layout(location=0) in vec4 aPos;
+layout(location=1) in vec4 aVel;
+uniform mat3 uRot;
+uniform float uAspect, uFocal, uCamDist, uSize, uSizeBoost, uPixelRatio, uHeight;
+uniform vec3 uPrimary, uAccent;
+out vec3 vColor;
+out float vAlpha;
 void main() {
-  fragColor = vec4(0.0);
+  vec3 v = uRot * aPos.xyz;
+  float w = max(uCamDist - v.z, 0.15);
+  gl_Position = vec4(v.x * uFocal / uAspect, v.y * uFocal, 0.0, w);
+  float speed = length(aVel.xyz);
+  float m = clamp(speed * 0.35 + fract(aPos.w * 7.13) * 0.45, 0.0, 1.0);
+  vColor = mix(uPrimary, uAccent, m) * (0.75 + 0.5 * clamp(speed * 0.25, 0.0, 1.0));
+  float px = uSize * uSizeBoost * uPixelRatio * (uHeight / 900.0) * 7.0 / w;
+  gl_PointSize = clamp(px, 1.0, 48.0);
+  vAlpha = clamp(0.6 * 4.2 / w, 0.2, 0.95);
 }`;
 
-const RENDER_VERTEX_SHADER = `#version 300 es
-precision highp float;
-
-layout(location = 0) in vec4 aPosEnergy;
-layout(location = 1) in vec4 aVelSeed;
-
-uniform float uAspect;
-uniform vec2 uCursor;
-uniform float uPointSize;
-uniform vec4 uAudio;
-uniform float uAudioSensitivity;
-
-out float vSpeed;
-out float vEnergy;
-out vec3 vPos;
-out float vSeed;
-
+const RENDER_FS = `#version 300 es
+precision mediump float;
+in vec3 vColor;
+in float vAlpha;
+out vec4 o;
 void main() {
-  vec3 pos = aPosEnergy.xyz;
-  vEnergy = aPosEnergy.w;
-  vSpeed = length(aVelSeed.xyz);
-  vPos = pos;
-  vSeed = aVelSeed.w;
-
-  // Subtle camera parallax tied to cursor
-  vec3 viewPos = pos;
-  viewPos.x -= uCursor.x * 0.08;
-  viewPos.y -= uCursor.y * 0.08;
-
-  float camZ = 3.1;
-  float zDist = max(0.5, camZ - viewPos.z);
-  float projScale = 2.05 / zDist;
-
-  gl_Position = vec4(
-    (viewPos.x * projScale) / max(0.1, uAspect),
-    viewPos.y * projScale,
-    clamp(-viewPos.z * 0.15, -0.95, 0.95),
-    1.0
-  );
-
-  float audioBoost = 1.0 + (uAudio.w * 0.85 + uAudio.x * 0.45) * uAudioSensitivity;
-  gl_PointSize = clamp(uPointSize * projScale * (0.72 + vEnergy * 0.65) * audioBoost, 1.2, 16.0);
+  vec2 c = gl_PointCoord * 2.0 - 1.0;
+  float d = dot(c, c);
+  if (d > 1.0) discard;
+  float a = (1.0 - d) * (1.0 - d) * vAlpha;
+  o = vec4(vColor * a, a);
 }`;
 
-function buildRenderFragmentShader(customColorGlsl: string): string {
-  return `#version 300 es
-precision highp float;
-
-in float vSpeed;
-in float vEnergy;
-in vec3 vPos;
-in float vSeed;
-
-uniform vec4 uAudio;
-uniform float uAudioSensitivity;
-uniform vec3 uPrimaryColor;
-uniform vec3 uAccentColor;
-
-out vec4 fragColor;
-
-${customColorGlsl}
-
-void main() {
-  vec2 uv = gl_PointCoord * 2.0 - 1.0;
-  float r2 = dot(uv, uv);
-  if (r2 > 1.0) discard;
-
-  float alpha = exp(-r2 * 3.1) * (0.48 + vEnergy * 0.46);
-  vec4 scaledAudio = uAudio * uAudioSensitivity;
-  vec3 col = customColor(vSpeed, vEnergy, scaledAudio, vPos, vSeed, uPrimaryColor, uAccentColor);
-  fragColor = vec4(col, clamp(alpha, 0.0, 1.0));
-}`;
+function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
+  const s = gl.createShader(type)!;
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error(`Shader compile failed: ${log}`);
+  }
+  return s;
 }
 
-export interface ShaderCompileResult {
-  ok: boolean;
-  error?: string;
+function link(gl: WebGL2RenderingContext, vs: string, fs: string, varyings?: string[]): WebGLProgram {
+  const p = gl.createProgram()!;
+  const v = compile(gl, gl.VERTEX_SHADER, vs);
+  const f = compile(gl, gl.FRAGMENT_SHADER, fs);
+  gl.attachShader(p, v);
+  gl.attachShader(p, f);
+  if (varyings) gl.transformFeedbackVaryings(p, varyings, gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  gl.deleteShader(v);
+  gl.deleteShader(f);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`Program link failed: ${gl.getProgramInfoLog(p)}`);
+  return p;
 }
+
+type Uniforms = Record<string, WebGLUniformLocation | null>;
+
+function uniforms(gl: WebGL2RenderingContext, p: WebGLProgram, names: string[]): Uniforms {
+  const u: Uniforms = {};
+  for (const n of names) u[n] = gl.getUniformLocation(p, n);
+  return u;
+}
+
+interface Live {
+  primary: [number, number, number];
+  accent: [number, number, number];
+  background: [number, number, number];
+  speed: number;
+  size: number;
+  turbulence: number;
+  shapeStrength: number;
+  force: number;
+}
+
+const lerp = (a: number, b: number, k: number) => a + (b - a) * k;
+const PLANAR = new Set(['heart', 'star', 'flower']);
 
 export class ParticleEngine {
-  private canvas: HTMLCanvasElement;
-  private gl: WebGL2RenderingContext;
+  private readonly canvas: HTMLCanvasElement;
+  private gl!: WebGL2RenderingContext;
+  private opts: EngineOptions;
+  private updateProg!: WebGLProgram;
+  private renderProg!: WebGLProgram;
+  private uu!: Uniforms;
+  private ru!: Uniforms;
+  private vaos: WebGLVertexArrayObject[] = [];
+  private stateBufs: WebGLBuffer[] = [];
+  private targetBuf!: WebGLBuffer;
+  private tf!: WebGLTransformFeedback;
+  private read = 0;
+  private raf = 0;
+  private running = false;
+  private lost = false;
+  private last = 0;
+  private time = 0;
 
-  private updateProgram: WebGLProgram | null = null;
-  private renderProgram: WebGLProgram | null = null;
+  private params: VisualParams;
+  private live: Live;
+  private targets: Float32Array<ArrayBuffer>;
+  private behaviorIndex = 0;
 
-  private vboA: WebGLBuffer | null = null;
-  private vboB: WebGLBuffer | null = null;
-  private targetVbo: WebGLBuffer | null = null;
-  private vaoA: WebGLVertexArrayObject | null = null;
-  private vaoB: WebGLVertexArrayObject | null = null;
-  private tf: WebGLTransformFeedback | null = null;
+  private userCount: number;
+  private count: number;
+  private autoQuality: boolean;
 
-  private readIndex = 0;
-  private config: PhysicsConfig;
-  private forceCode = DEFAULT_FORCE_CODE;
-  private colorCode = DEFAULT_COLOR_CODE;
-  private customAnchors?: number[];
+  // camera
+  private yaw = 0.4;
+  private pitch = 0.35;
+  private swayT = 0;
+  private camDist = 4.2;
+  private targetCamDist = 4.2;
+  private autoRotate = true;
 
-  private cursor = { x: 0, y: 0, vx: 0, vy: 0, down: 0 };
-  private prevCursor = { x: 0, y: 0 };
+  // pointer
+  private mode: PointerMode = 'attract';
+  private pointers = new Map<number, { x: number; y: number; type: string }>();
+  private pointer = { x: 0, y: 0, vx: 0, vy: 0, down: false, hover: 0 };
+  private pinchDist = 0;
+  private lastPointerMove = 0;
 
-  private startTime = performance.now();
-  private lastFrameTime = performance.now();
-  private rafId = 0;
-  private contextLost = false;
-  private reducedMotion = false;
+  // stats
+  private frameTimes: number[] = [];
+  private statsAt = 0;
+  private qualityAt = 0;
+  private dpr = 1;
+  private readonly rot: Float32Array<ArrayBuffer> = new Float32Array(9);
+  private readonly cleanup: Array<() => void> = [];
+  private ro?: ResizeObserver;
 
-  private fpsCounter = { frames: 0, lastSample: performance.now(), fps: 60 };
-  private onContextStatus?: (lost: boolean) => void;
-  private onFpsUpdate?: (fps: number) => void;
-
-  constructor(
-    canvas: HTMLCanvasElement,
-    initialConfig: PhysicsConfig,
-    callbacks?: {
-      onContextStatus?: (lost: boolean) => void;
-      onFpsUpdate?: (fps: number) => void;
-    }
-  ) {
+  constructor(canvas: HTMLCanvasElement, params: VisualParams, opts: EngineOptions) {
     this.canvas = canvas;
-    this.config = { ...initialConfig };
-    this.onContextStatus = callbacks?.onContextStatus;
-    this.onFpsUpdate = callbacks?.onFpsUpdate;
-    this.reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    this.opts = opts;
+    this.params = { ...params };
+    this.live = this.toLive(params);
+    this.userCount = Math.min(opts.initialCount, opts.maxParticles);
+    this.count = this.userCount;
+    this.autoQuality = opts.autoQuality;
+    this.targets = buildShapeTargets(params.shape, opts.maxParticles);
+    this.behaviorIndex = Math.max(0, BEHAVIORS.indexOf(params.behavior));
+    this.autoRotate = !opts.reducedMotion;
+    this.initGl();
+    this.bindEvents();
+  }
 
-    const gl = canvas.getContext('webgl2', {
-      alpha: false,
+  private toLive(p: VisualParams): Live {
+    return {
+      primary: hexToRgb(p.primary),
+      accent: hexToRgb(p.accent),
+      background: hexToRgb(p.background),
+      speed: p.speed,
+      size: p.size,
+      turbulence: p.turbulence,
+      shapeStrength: p.shapeStrength,
+      force: p.force,
+    };
+  }
+
+  private initGl(): void {
+    const gl = this.canvas.getContext('webgl2', {
       antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
       powerPreference: 'high-performance',
-      premultipliedAlpha: false,
+      preserveDrawingBuffer: false,
     });
-
-    if (!gl) {
-      throw new Error('WebGL2 is required for the GPU particle simulation.');
-    }
-
+    if (!gl) throw new Error('WebGL2 is not available in this browser.');
     this.gl = gl;
-    this.attachContextListeners();
-    this.initResources();
+    this.updateProg = link(gl, UPDATE_VS, UPDATE_FS, ['vPos', 'vVel']);
+    this.renderProg = link(gl, RENDER_VS, RENDER_FS);
+    this.uu = uniforms(gl, this.updateProg, [
+      'uTime', 'uDt', 'uTurb', 'uShapeStrength', 'uForce', 'uRadius', 'uAspect', 'uFocal', 'uCamDist',
+      'uBehavior', 'uRot', 'uPointer', 'uPointerVel', 'uPointerDown', 'uPointerHover', 'uMode',
+    ]);
+    this.ru = uniforms(gl, this.renderProg, [
+      'uRot', 'uAspect', 'uFocal', 'uCamDist', 'uSize', 'uSizeBoost', 'uPixelRatio', 'uHeight', 'uPrimary', 'uAccent',
+    ]);
+
+    const n = this.opts.maxParticles;
+    const init = new Float32Array(n * 8);
+    for (let i = 0; i < n; i++) {
+      const u = Math.random() * 2 - 1;
+      const th = Math.random() * Math.PI * 2;
+      const r = Math.cbrt(Math.random()) * 2.2;
+      const s = Math.sqrt(1 - u * u);
+      init[i * 8] = s * Math.cos(th) * r;
+      init[i * 8 + 1] = u * r;
+      init[i * 8 + 2] = s * Math.sin(th) * r;
+      init[i * 8 + 3] = Math.random();
+      init[i * 8 + 7] = Math.random();
+    }
+
+    this.targetBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.targetBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, this.targets, gl.DYNAMIC_DRAW);
+
+    this.stateBufs = [];
+    this.vaos = [];
+    for (let k = 0; k < 2; k++) {
+      const buf = gl.createBuffer()!;
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, init, gl.DYNAMIC_COPY);
+      const vao = gl.createVertexArray()!;
+      gl.bindVertexArray(vao);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.targetBuf);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 12, 0);
+      gl.bindVertexArray(null);
+      this.stateBufs.push(buf);
+      this.vaos.push(vao);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    this.tf = gl.createTransformFeedback()!;
+    this.read = 0;
+    this.resize();
   }
 
-  private attachContextListeners(): void {
-    this.canvas.addEventListener('webglcontextlost', (e) => {
+  private bindEvents(): void {
+    const c = this.canvas;
+    const on = <K extends keyof HTMLElementEventMap>(
+      el: HTMLElement | Window,
+      ev: K | string,
+      fn: (e: never) => void,
+      o?: AddEventListenerOptions,
+    ) => {
+      el.addEventListener(ev, fn as EventListener, o);
+      this.cleanup.push(() => el.removeEventListener(ev, fn as EventListener, o));
+    };
+
+    on(c, 'webglcontextlost', (e: Event) => {
       e.preventDefault();
-      this.contextLost = true;
-      this.onContextStatus?.(true);
+      this.lost = true;
+      cancelAnimationFrame(this.raf);
+      this.opts.onContextChange?.(true);
+    });
+    on(c, 'webglcontextrestored', () => {
+      this.lost = false;
+      try {
+        this.initGl();
+        this.opts.onContextChange?.(false);
+        if (this.running) this.loop();
+      } catch {
+        this.opts.onContextChange?.(true);
+      }
     });
 
-    this.canvas.addEventListener('webglcontextrestored', () => {
-      this.contextLost = false;
-      this.initResources();
-      this.onContextStatus?.(false);
+    on(c, 'pointerdown', (e: PointerEvent) => {
+      c.setPointerCapture?.(e.pointerId);
+      this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+      if (this.pointers.size === 2) {
+        this.pinchDist = this.currentPinch();
+        this.pointer.down = false;
+      } else {
+        this.updatePointer(e.clientX, e.clientY, true);
+        this.pointer.down = this.mode !== 'orbit';
+      }
     });
-  }
-
-  private compileShader(type: number, source: string): { shader?: WebGLShader; error?: string } {
-    const shader = this.gl.createShader(type);
-    if (!shader) return { error: 'Failed to allocate WebGL shader object.' };
-    this.gl.shaderSource(shader, source);
-    this.gl.compileShader(shader);
-    if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
-      const info = this.gl.getShaderInfoLog(shader) || 'Unknown GLSL compile error.';
-      this.gl.deleteShader(shader);
-      return { error: info.trim() };
-    }
-    return { shader };
-  }
-
-  private buildProgram(
-    vsSource: string,
-    fsSource: string,
-    transformVaryings?: string[]
-  ): { program?: WebGLProgram; error?: string } {
-    const gl = this.gl;
-    const vs = this.compileShader(gl.VERTEX_SHADER, vsSource);
-    if (!vs.shader) return { error: vs.error };
-
-    const fs = this.compileShader(gl.FRAGMENT_SHADER, fsSource);
-    if (!fs.shader) {
-      gl.deleteShader(vs.shader);
-      return { error: fs.error };
-    }
-
-    const program = gl.createProgram();
-    if (!program) {
-      gl.deleteShader(vs.shader);
-      gl.deleteShader(fs.shader);
-      return { error: 'Failed to allocate WebGL program.' };
-    }
-
-    gl.attachShader(program, vs.shader);
-    gl.attachShader(program, fs.shader);
-
-    if (transformVaryings && transformVaryings.length > 0) {
-      gl.transformFeedbackVaryings(program, transformVaryings, gl.INTERLEAVED_ATTRIBS);
-    }
-
-    gl.linkProgram(program);
-    gl.deleteShader(vs.shader);
-    gl.deleteShader(fs.shader);
-
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      const info = gl.getProgramInfoLog(program) || 'Program link failed.';
-      gl.deleteProgram(program);
-      return { error: info.trim() };
-    }
-
-    return { program };
-  }
-
-  private initResources(): void {
-    const gl = this.gl;
-
-    // Compile initial programs
-    const updateRes = this.buildProgram(
-      buildUpdateVertexShader(this.forceCode),
-      UPDATE_FRAGMENT_SHADER,
-      ['vPosEnergy', 'vVelSeed']
+    on(c, 'pointermove', (e: PointerEvent) => {
+      const prev = this.pointers.get(e.pointerId);
+      if (prev) {
+        const dx = e.clientX - prev.x;
+        const dy = e.clientY - prev.y;
+        prev.x = e.clientX;
+        prev.y = e.clientY;
+        if (this.pointers.size === 2) {
+          const d = this.currentPinch();
+          if (this.pinchDist > 0) this.zoomBy(this.pinchDist / Math.max(d, 1));
+          this.pinchDist = d;
+          return;
+        }
+        if (this.mode === 'orbit') {
+          this.yaw += dx * 0.006;
+          this.pitch = Math.max(-1.3, Math.min(1.3, this.pitch + dy * 0.006));
+        }
+      }
+      this.updatePointer(e.clientX, e.clientY, false);
+      if (e.pointerType === 'mouse') this.pointer.hover = 1;
+    });
+    const end = (e: PointerEvent) => {
+      this.pointers.delete(e.pointerId);
+      if (this.pointers.size < 2) this.pinchDist = 0;
+      if (this.pointers.size === 0) {
+        this.pointer.down = false;
+        if (e.pointerType !== 'mouse') this.pointer.hover = 0;
+      }
+    };
+    on(c, 'pointerup', end);
+    on(c, 'pointercancel', end);
+    on(c, 'pointerleave', (e: PointerEvent) => {
+      if (e.pointerType === 'mouse') this.pointer.hover = 0;
+    });
+    on(
+      c,
+      'wheel',
+      (e: WheelEvent) => {
+        e.preventDefault();
+        this.zoomBy(Math.exp(e.deltaY * 0.0012));
+      },
+      { passive: false },
     );
-    if (!updateRes.program) {
-      throw new Error(`Initial update shader failed: ${updateRes.error}`);
-    }
-
-    const renderRes = this.buildProgram(
-      RENDER_VERTEX_SHADER,
-      buildRenderFragmentShader(this.colorCode)
-    );
-    if (!renderRes.program) {
-      throw new Error(`Initial render shader failed: ${renderRes.error}`);
-    }
-
-    this.updateProgram = updateRes.program;
-    this.renderProgram = renderRes.program;
-
-    // Initialize 65,536 particles (8 floats per particle: pos.xyz, energy, vel.xyz, seed)
-    const initialState = new Float32Array(MAX_PARTICLES * 8);
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      const idx = i * 8;
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(2 * Math.random() - 1);
-      const r = 0.25 + Math.cbrt(Math.random()) * 1.05;
-      initialState[idx] = r * Math.sin(phi) * Math.cos(theta);
-      initialState[idx + 1] = r * Math.sin(phi) * Math.sin(theta);
-      initialState[idx + 2] = r * Math.cos(phi);
-      initialState[idx + 3] = Math.random() * 0.5;
-      initialState[idx + 4] = (Math.random() - 0.5) * 0.1;
-      initialState[idx + 5] = (Math.random() - 0.5) * 0.1;
-      initialState[idx + 6] = (Math.random() - 0.5) * 0.1;
-      initialState[idx + 7] = i / MAX_PARTICLES;
-    }
-
-    this.vboA = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboA);
-    gl.bufferData(gl.ARRAY_BUFFER, initialState, gl.DYNAMIC_COPY);
-
-    this.vboB = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboB);
-    gl.bufferData(gl.ARRAY_BUFFER, initialState, gl.DYNAMIC_COPY);
-
-    const targets = buildFormationTargets(this.config.formation, MAX_PARTICLES, this.customAnchors);
-    this.targetVbo = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.targetVbo);
-    gl.bufferData(gl.ARRAY_BUFFER, targets, gl.DYNAMIC_DRAW);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-
-    this.vaoA = this.setupVao(this.vboA!);
-    this.vaoB = this.setupVao(this.vboB!);
-    this.tf = gl.createTransformFeedback();
-    this.readIndex = 0;
+    this.ro = new ResizeObserver(() => this.resize());
+    this.ro.observe(c);
+    this.cleanup.push(() => this.ro?.disconnect());
   }
 
-  private setupVao(stateBuffer: WebGLBuffer): WebGLVertexArrayObject {
-    const gl = this.gl;
-    const vao = gl.createVertexArray()!;
-    gl.bindVertexArray(vao);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, stateBuffer);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.targetVbo);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 12, 0);
-
-    gl.bindVertexArray(null);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    return vao;
+  private currentPinch(): number {
+    const pts = [...this.pointers.values()];
+    if (pts.length < 2) return 0;
+    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
   }
 
-  public updateShaders(forceCode: string, colorCode: string): ShaderCompileResult {
-    const nextUpdate = this.buildProgram(
-      buildUpdateVertexShader(forceCode),
-      UPDATE_FRAGMENT_SHADER,
-      ['vPosEnergy', 'vVelSeed']
-    );
-    if (!nextUpdate.program) {
-      return { ok: false, error: `Force shader error: ${nextUpdate.error}` };
+  private zoomBy(f: number): void {
+    this.targetCamDist = Math.max(1.8, Math.min(9, this.targetCamDist * f));
+  }
+
+  private updatePointer(clientX: number, clientY: number, reset: boolean): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = ((clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1;
+    const y = -(((clientY - rect.top) / Math.max(rect.height, 1)) * 2 - 1);
+    const now = performance.now();
+    const dt = Math.max((now - this.lastPointerMove) / 1000, 1 / 240);
+    if (!reset) {
+      this.pointer.vx = Math.max(-3, Math.min(3, (x - this.pointer.x) / dt / 10));
+      this.pointer.vy = Math.max(-3, Math.min(3, (y - this.pointer.y) / dt / 10));
+    } else {
+      this.pointer.vx = 0;
+      this.pointer.vy = 0;
     }
-
-    const nextRender = this.buildProgram(
-      RENDER_VERTEX_SHADER,
-      buildRenderFragmentShader(colorCode)
-    );
-    if (!nextRender.program) {
-      this.gl.deleteProgram(nextUpdate.program);
-      return { ok: false, error: `Color shader error: ${nextRender.error}` };
-    }
-
-    if (this.updateProgram) this.gl.deleteProgram(this.updateProgram);
-    if (this.renderProgram) this.gl.deleteProgram(this.renderProgram);
-
-    this.updateProgram = nextUpdate.program;
-    this.renderProgram = nextRender.program;
-    this.forceCode = forceCode;
-    this.colorCode = colorCode;
-    return { ok: true };
+    this.pointer.x = x;
+    this.pointer.y = y;
+    this.lastPointerMove = now;
   }
 
-  public updateConfig(next: Partial<PhysicsConfig>): void {
-    const prevFormation = this.config.formation;
-    this.config = { ...this.config, ...next };
-    if (next.formation && next.formation !== prevFormation) {
-      this.uploadFormationTargets(next.formation, this.customAnchors);
-    }
-  }
-
-  public setCustomTargets(anchorTriplets: number[], formation: FormationId = 'custom'): void {
-    this.customAnchors = anchorTriplets;
-    this.config.formation = formation;
-    if (this.config.morphStrength < 0.2) {
-      this.config.morphStrength = 0.72;
-    }
-    this.uploadFormationTargets(formation, anchorTriplets);
-  }
-
-  private uploadFormationTargets(formation: FormationId, customAnchors?: number[]): void {
-    if (!this.targetVbo) return;
-    const targets = buildFormationTargets(formation, MAX_PARTICLES, customAnchors);
-    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.targetVbo);
-    this.gl.bufferSubData(this.gl.ARRAY_BUFFER, 0, targets);
-    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, null);
-  }
-
-  public setCursor(nx: number, ny: number, downState: number): void {
-    this.cursor.x = nx;
-    this.cursor.y = ny;
-    this.cursor.down = downState;
-  }
-
-  public resize(width: number, height: number): void {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(1, Math.floor(width * dpr));
-    const h = Math.max(1, Math.floor(height * dpr));
+  resize(): void {
+    if (this.lost) return;
+    const coarse = matchMedia('(pointer: coarse)').matches;
+    this.dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
+    const w = Math.max(1, Math.round(this.canvas.clientWidth * this.dpr));
+    const h = Math.max(1, Math.round(this.canvas.clientHeight * this.dpr));
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
     }
   }
 
-  public start(getAudioMetrics: () => AudioMetrics): void {
-    const renderLoop = (now: number) => {
-      this.rafId = requestAnimationFrame(renderLoop);
-      if (this.contextLost) return;
-
-      const rawDt = (now - this.lastFrameTime) / 1000;
-      this.lastFrameTime = now;
-      const dt = this.reducedMotion ? Math.min(rawDt, 0.016) * 0.25 : Math.min(rawDt, 0.033);
-      const elapsed = (now - this.startTime) / 1000;
-
-      // Cursor velocity smoothed
-      this.cursor.vx = (this.cursor.x - this.prevCursor.x) * 0.55 + this.cursor.vx * 0.45;
-      this.cursor.vy = (this.cursor.y - this.prevCursor.y) * 0.55 + this.cursor.vy * 0.45;
-      this.prevCursor.x = this.cursor.x;
-      this.prevCursor.y = this.cursor.y;
-
-      const audio = getAudioMetrics();
-      this.stepAndDraw(elapsed, dt, audio);
-
-      // FPS sampling
-      this.fpsCounter.frames++;
-      if (now - this.fpsCounter.lastSample >= 500) {
-        const fps = Math.round(
-          (this.fpsCounter.frames * 1000) / (now - this.fpsCounter.lastSample)
-        );
-        this.fpsCounter.fps = fps;
-        this.fpsCounter.frames = 0;
-        this.fpsCounter.lastSample = now;
-        this.onFpsUpdate?.(fps);
+  // ----- public API -----
+  setParams(p: VisualParams): void {
+    if (p.shape !== this.params.shape) {
+      this.targets = buildShapeTargets(p.shape, this.opts.maxParticles, this.targets);
+      if (!this.lost) {
+        const gl = this.gl;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.targetBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.targets);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
       }
-    };
-
-    this.lastFrameTime = performance.now();
-    this.rafId = requestAnimationFrame(renderLoop);
+    }
+    this.behaviorIndex = Math.max(0, BEHAVIORS.indexOf(p.behavior));
+    this.params = { ...p };
   }
 
-  private stepAndDraw(elapsed: number, dt: number, audio: AudioMetrics): void {
+  setCount(n: number): void {
+    this.userCount = Math.max(1000, Math.min(this.opts.maxParticles, Math.round(n)));
+    this.count = this.userCount;
+  }
+
+  setAutoQuality(on: boolean): void {
+    this.autoQuality = on;
+    if (!on) this.count = this.userCount;
+  }
+
+  setMode(m: PointerMode): void {
+    this.mode = m;
+  }
+
+  /** Only scales motion; auto-rotate is controlled separately via setAutoRotate (user setting). */
+  setReducedMotion(on: boolean): void {
+    this.opts.reducedMotion = on;
+  }
+
+  setAutoRotate(on: boolean): void {
+    this.autoRotate = on;
+  }
+
+  resetCamera(): void {
+    this.yaw = 0.4;
+    this.pitch = 0.35;
+    this.targetCamDist = 4.2;
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.last = performance.now();
+    this.loop();
+  }
+
+  stop(): void {
+    this.running = false;
+    cancelAnimationFrame(this.raf);
+  }
+
+  dispose(): void {
+    this.stop();
+    for (const f of this.cleanup) f();
+    this.cleanup.length = 0;
     const gl = this.gl;
-    if (!this.updateProgram || !this.renderProgram || !this.tf) return;
+    if (!gl || this.lost) return;
+    for (const b of this.stateBufs) gl.deleteBuffer(b);
+    for (const v of this.vaos) gl.deleteVertexArray(v);
+    gl.deleteBuffer(this.targetBuf);
+    gl.deleteTransformFeedback(this.tf);
+    gl.deleteProgram(this.updateProg);
+    gl.deleteProgram(this.renderProg);
+  }
 
-    const count = Math.min(this.config.particleCount, MAX_PARTICLES);
-    const aspect = this.canvas.width / Math.max(1, this.canvas.height);
+  private loop = (): void => {
+    if (!this.running || this.lost) return;
+    this.raf = requestAnimationFrame(this.loop);
+    const now = performance.now();
+    const rawDt = (now - this.last) / 1000;
+    this.last = now;
+    this.trackFrame(now, rawDt);
+    this.frame(Math.min(rawDt, 1 / 30));
+  };
 
-    const readVao = this.readIndex === 0 ? this.vaoA : this.vaoB;
-    const writeVbo = this.readIndex === 0 ? this.vboB : this.vboA;
-    const drawVao = this.readIndex === 0 ? this.vaoB : this.vaoA;
+  private trackFrame(now: number, dt: number): void {
+    if (dt > 0 && dt < 1) this.frameTimes.push(dt);
+    if (this.frameTimes.length > 120) this.frameTimes.shift();
+    if (now - this.statsAt > 500) {
+      this.statsAt = now;
+      const fps = this.currentFps();
+      this.opts.onStats?.({ fps, count: this.count, targetCount: this.userCount });
+      (window as unknown as { __particleStats?: EngineStats }).__particleStats = { fps, count: this.count, targetCount: this.userCount };
+    }
+    if (this.autoQuality && now - this.qualityAt > 1200 && this.frameTimes.length >= 30) {
+      this.qualityAt = now;
+      const fps = this.currentFps();
+      if (fps < 50 && this.count > 2000) {
+        this.count = Math.max(2000, Math.round(this.count * (fps < 35 ? 0.6 : 0.8)));
+        this.frameTimes.length = 0;
+      } else if (fps > 58 && this.count < this.userCount) {
+        this.count = Math.min(this.userCount, Math.round(this.count * 1.1));
+      }
+    }
+  }
 
-    // Pass 1: GPU Transform Feedback Physics Simulation
-    gl.useProgram(this.updateProgram);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uTime'), elapsed);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uDt'), dt);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uAspect'), aspect);
-    gl.uniform2f(gl.getUniformLocation(this.updateProgram, 'uCursor'), this.cursor.x, this.cursor.y);
-    gl.uniform2f(gl.getUniformLocation(this.updateProgram, 'uCursorVel'), this.cursor.vx, this.cursor.vy);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uCursorDown'), this.cursor.down);
-    gl.uniform4f(
-      gl.getUniformLocation(this.updateProgram, 'uAudio'),
-      audio.bass,
-      audio.mid,
-      audio.treble,
-      audio.cadence
-    );
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uCurlStrength'), this.config.curlStrength);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uViscosity'), this.config.viscosity);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uCursorRadius'), this.config.cursorRadius);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uCursorForce'), this.config.cursorForce);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uMorphStrength'), this.config.morphStrength);
-    gl.uniform1f(gl.getUniformLocation(this.updateProgram, 'uAudioSensitivity'), this.config.audioSensitivity);
+  private currentFps(): number {
+    if (!this.frameTimes.length) return 0;
+    const sorted = [...this.frameTimes].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    return Math.round(1 / median);
+  }
 
-    gl.bindVertexArray(readVao);
+  private frame(dt: number): void {
+    const gl = this.gl;
+    const p = this.params;
+    const L = this.live;
+    const k = 1 - Math.exp(-dt * 3);
+    const tp = hexToRgb(p.primary);
+    const ta = hexToRgb(p.accent);
+    const tb = hexToRgb(p.background);
+    for (let i = 0; i < 3; i++) {
+      L.primary[i] = lerp(L.primary[i], tp[i], k);
+      L.accent[i] = lerp(L.accent[i], ta[i], k);
+      L.background[i] = lerp(L.background[i], tb[i], k);
+    }
+    L.speed = lerp(L.speed, p.speed, k);
+    L.size = lerp(L.size, p.size, k);
+    L.turbulence = lerp(L.turbulence, p.turbulence, k);
+    L.shapeStrength = lerp(L.shapeStrength, p.shapeStrength, k);
+    L.force = lerp(L.force, p.force, k);
+
+    const motion = this.opts.reducedMotion ? 0.35 : 1;
+    const simDt = dt * L.speed * motion;
+    this.time += simDt;
+    if (this.autoRotate && this.pointers.size === 0) {
+      if (PLANAR.has(p.shape) && this.mode !== 'orbit') {
+        this.swayT += dt * motion;
+        const targetYaw = Math.sin(this.swayT * 0.35) * 0.45;
+        const wrapped = Math.atan2(Math.sin(this.yaw), Math.cos(this.yaw));
+        this.yaw = lerp(wrapped, targetYaw, 1 - Math.exp(-dt * 1.5));
+      } else {
+        this.yaw += dt * 0.08 * motion;
+      }
+    }
+    this.camDist = lerp(this.camDist, this.targetCamDist, 1 - Math.exp(-dt * 8));
+    // pointer velocity decays when not moving
+    this.pointer.vx *= Math.exp(-dt * 6);
+    this.pointer.vy *= Math.exp(-dt * 6);
+
+    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+    const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+    // R = Rx(pitch) * Ry(yaw), column-major
+    const rot = this.rot;
+    rot[0] = cy; rot[1] = sp * sy; rot[2] = -cp * sy;
+    rot[3] = 0; rot[4] = cp; rot[5] = sp;
+    rot[6] = sy; rot[7] = -sp * cy; rot[8] = cp * cy;
+    const aspect = this.canvas.width / Math.max(this.canvas.height, 1);
+    const focal = 1 / Math.tan((50 * Math.PI) / 360);
+    // portrait screens: pull the camera back so shapes fit the narrow width
+    const camDist = this.camDist * (aspect < 1 ? Math.min(2.2, 0.85 / Math.max(aspect, 0.2)) : 1);
+    const count = this.count;
+    const write = 1 - this.read;
+
+    // simulate
+    gl.useProgram(this.updateProg);
+    const u = this.uu;
+    gl.uniform1f(u.uTime, this.time);
+    gl.uniform1f(u.uDt, Math.max(simDt, 0.0001));
+    gl.uniform1f(u.uTurb, L.turbulence);
+    gl.uniform1f(u.uShapeStrength, L.shapeStrength);
+    gl.uniform1f(u.uForce, L.force);
+    gl.uniform1f(u.uRadius, 0.55 + L.force * 0.12);
+    gl.uniform1f(u.uAspect, aspect);
+    gl.uniform1f(u.uFocal, focal);
+    gl.uniform1f(u.uCamDist, camDist);
+    gl.uniform1i(u.uBehavior, this.behaviorIndex);
+    gl.uniformMatrix3fv(u.uRot, false, rot);
+    gl.uniform2f(u.uPointer, this.pointer.x, this.pointer.y);
+    gl.uniform2f(u.uPointerVel, this.pointer.vx, this.pointer.vy);
+    gl.uniform1f(u.uPointerDown, this.pointer.down ? 1 : 0);
+    gl.uniform1f(u.uPointerHover, this.pointer.hover * 0.5);
+    gl.uniform1i(u.uMode, ['attract', 'repel', 'swirl', 'orbit'].indexOf(this.mode));
+
+    gl.bindVertexArray(this.vaos[this.read]);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, this.tf);
-    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, writeVbo);
-
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, this.stateBufs[write]);
     gl.enable(gl.RASTERIZER_DISCARD);
     gl.beginTransformFeedback(gl.POINTS);
     gl.drawArrays(gl.POINTS, 0, count);
     gl.endTransformFeedback();
     gl.disable(gl.RASTERIZER_DISCARD);
-
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
-    gl.bindVertexArray(null);
 
-    // Pass 2: Luminous Particle Rendering
+    // render
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(0.027, 0.035, 0.055, 1.0); // #07090E obsidian
+    gl.clearColor(L.background[0], L.background[1], L.background[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
-
-    gl.useProgram(this.renderProgram);
-    gl.uniform1f(gl.getUniformLocation(this.renderProgram, 'uAspect'), aspect);
-    gl.uniform2f(gl.getUniformLocation(this.renderProgram, 'uCursor'), this.cursor.x, this.cursor.y);
-    gl.uniform1f(gl.getUniformLocation(this.renderProgram, 'uPointSize'), this.config.pointSize);
-    gl.uniform4f(
-      gl.getUniformLocation(this.renderProgram, 'uAudio'),
-      audio.bass,
-      audio.mid,
-      audio.treble,
-      audio.cadence
-    );
-    gl.uniform1f(gl.getUniformLocation(this.renderProgram, 'uAudioSensitivity'), this.config.audioSensitivity);
-
-    const [pr, pg, pb] = hexToRgbTuple(this.config.primaryColor);
-    const [ar, ag, ab] = hexToRgbTuple(this.config.accentColor);
-    gl.uniform3f(gl.getUniformLocation(this.renderProgram, 'uPrimaryColor'), pr, pg, pb);
-    gl.uniform3f(gl.getUniformLocation(this.renderProgram, 'uAccentColor'), ar, ag, ab);
-
-    gl.bindVertexArray(drawVao);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this.renderProg);
+    const r = this.ru;
+    gl.uniformMatrix3fv(r.uRot, false, rot);
+    gl.uniform1f(r.uAspect, aspect);
+    gl.uniform1f(r.uFocal, focal);
+    gl.uniform1f(r.uCamDist, camDist);
+    gl.uniform1f(r.uSize, L.size);
+    // fewer particles (auto quality / low count) -> slightly larger points to keep the image full
+    gl.uniform1f(r.uSizeBoost, Math.min(1.8, Math.max(1, Math.sqrt(40_000 / Math.max(count, 1)))));
+    gl.uniform1f(r.uPixelRatio, this.dpr);
+    gl.uniform1f(r.uHeight, this.canvas.clientHeight || 900);
+    gl.uniform3f(r.uPrimary, L.primary[0], L.primary[1], L.primary[2]);
+    gl.uniform3f(r.uAccent, L.accent[0], L.accent[1], L.accent[2]);
+    gl.bindVertexArray(this.vaos[write]);
     gl.drawArrays(gl.POINTS, 0, count);
     gl.bindVertexArray(null);
     gl.disable(gl.BLEND);
 
-    this.readIndex = 1 - this.readIndex;
-  }
-
-  public dispose(): void {
-    if (this.rafId) cancelAnimationFrame(this.rafId);
-    const gl = this.gl;
-    if (this.updateProgram) gl.deleteProgram(this.updateProgram);
-    if (this.renderProgram) gl.deleteProgram(this.renderProgram);
-    if (this.vboA) gl.deleteBuffer(this.vboA);
-    if (this.vboB) gl.deleteBuffer(this.vboB);
-    if (this.targetVbo) gl.deleteBuffer(this.targetVbo);
-    if (this.vaoA) gl.deleteVertexArray(this.vaoA);
-    if (this.vaoB) gl.deleteVertexArray(this.vaoB);
-    if (this.tf) gl.deleteTransformFeedback(this.tf);
+    this.read = write;
   }
 }
